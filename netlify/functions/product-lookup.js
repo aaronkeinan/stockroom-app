@@ -125,6 +125,14 @@ exports.handler = async function (event) {
     };
   }
 
+  if (body.debug) {
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(result.data),
+    };
+  }
+
   const candidate = result.data.candidates && result.data.candidates[0];
   const parts = (candidate && candidate.content && candidate.content.parts) || [];
   const text = parts
