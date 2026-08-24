@@ -130,6 +130,14 @@ exports.handler = async function (event) {
     text = result.ok ? extractText(result.data) : "";
   }
 
+  if (body.debug) {
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(result.data),
+    };
+  }
+
   if (!result.ok) {
     return {
       statusCode: result.status,
