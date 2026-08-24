@@ -95,6 +95,15 @@ exports.handler = async function (event) {
 
   const contents = anthropicMessagesToGeminiContents(body.messages);
 
+  function extractText(data) {
+    const candidate = data.candidates && data.candidates[0];
+    const parts = (candidate && candidate.content && candidate.content.parts) || [];
+    return parts
+      .map((p) => p.text || "")
+      .join("\n")
+      .trim();
+  }
+
   let result = await callGemini(apiKey, {
     system: body.system,
     contents,
@@ -102,15 +111,23 @@ exports.handler = async function (event) {
     withSearch: true,
   });
 
-  // A free-tier key without search-grounding access typically comes back as
-  // a 400 naming the tool. Retry once without it rather than failing.
-  if (!result.ok) {
+  let text = result.ok ? extractText(result.data) : "";
+
+  // Retry once without search grounding if the first attempt either failed
+  // outright (common on a free-tier key with no grounding access — usually
+  // a 400 naming the tool) or came back with an HTTP-level success but no
+  // usable text. The latter happens when the model's search-tool call itself
+  // gets malformed server-side (seen as finishReason "MALFORMED_FUNCTION_CALL"
+  // on some models/versions) — a 200 with nothing we can use, which the
+  // original !result.ok check alone wouldn't catch.
+  if (!result.ok || !text) {
     result = await callGemini(apiKey, {
       system: body.system,
       contents,
       maxOutputTokens: body.max_tokens,
       withSearch: false,
     });
+    text = result.ok ? extractText(result.data) : "";
   }
 
   if (!result.ok) {
@@ -125,20 +142,15 @@ exports.handler = async function (event) {
     };
   }
 
-  if (body.debug) {
+  if (!text) {
     return {
-      statusCode: 200,
+      statusCode: 502,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(result.data),
+      body: JSON.stringify({
+        error: "Gemini returned an empty response for that item — try again.",
+      }),
     };
   }
-
-  const candidate = result.data.candidates && result.data.candidates[0];
-  const parts = (candidate && candidate.content && candidate.content.parts) || [];
-  const text = parts
-    .map((p) => p.text || "")
-    .join("\n")
-    .trim();
 
   return {
     statusCode: 200,
