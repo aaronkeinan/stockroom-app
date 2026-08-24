@@ -1,0 +1,1606 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Stockroom</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js" crossorigin></script>
+<style>
+  html, body { margin: 0; padding: 0; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+// Compatibility shim: window.storage only exists inside claude.ai's sandbox.
+// On a normally deployed site it doesn't exist, so we fall back to
+// localStorage with the same get/set(key, value) async shape the app uses.
+if (!window.storage) {
+  window.storage = {
+    get: async (key) => ({ value: localStorage.getItem(key) }),
+    set: async (key, value) => { localStorage.setItem(key, value); }
+  };
+}
+
+// Deterministic palette assignment — categories are now specific product names
+// (e.g. "Curtains", "Sponges", "Extension Cords") rather than a small fixed
+// set of umbrella groups, so colors are hashed instead of dictionary-looked-up.
+const CATEGORY_PALETTE = [
+{ bg: "#F1D9CF", text: "#7A2E1B" }, // rust
+{ bg: "#DCE3D3", text: "#3E4E33" }, // sage
+{ bg: "#E6DFF0", text: "#4A3A70" }, // lavender
+{ bg: "#F5E7C4", text: "#6B4E0A" }, // amber
+{ bg: "#F1E0D0", text: "#6B4523" }, // tan
+{ bg: "#D6E5E8", text: "#2C5058" }, // teal
+{ bg: "#E2DCD0", text: "#4A4130" }, // stone
+{ bg: "#DCD6C6", text: "#4A4634" }, // olive
+{ bg: "#EFD8DE", text: "#7A2E4A" }, // rose
+{ bg: "#DDE6DA", text: "#3A5A44" }, // moss
+{ bg: "#E8DCC8", text: "#5C4A2A" }, // wheat
+{ bg: "#D9E0EA", text: "#33455F" } // slate
+];
+
+function getCategoryColor(cat) {
+if (!cat) return CATEGORY_PALETTE[CATEGORY_PALETTE.length - 1];
+let hash = 0;
+for (let i = 0; i < cat.length; i++) {
+hash = (hash << 5) - hash + cat.charCodeAt(i);
+hash |= 0;
+}
+return CATEGORY_PALETTE[Math.abs(hash) % CATEGORY_PALETTE.length];
+}
+
+function seededRotation(id) {
+let hash = 0;
+
+for (let i = 0; i < id.length; i++) {
+hash = (hash << 5) - hash + id.charCodeAt(i);
+hash |= 0;
+}
+return ((hash % 30) - 15) / 10;
+}
+
+function barcodeBars(seed) {
+let hash = 0;
+for (let i = 0; i < seed.length; i++) {
+hash = (hash << 5) - hash + seed.charCodeAt(i);
+hash |= 0;
+}
+const bars = [];
+let h = Math.abs(hash);
+for (let i = 0; i < 28; i++) {
+h = (h * 9301 + 49297) % 233280;
+bars.push(1 + (h % 3));
+}
+return bars;
+}
+
+function addDays(dateStr, days) {
+const d = new Date(dateStr + "T00:00:00");
+d.setDate(d.getDate() + days);
+return d;
+}
+
+function formatDate(d) {
+return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+// How many days out counts as "replace soon" — scales with the product's
+// own lifespan (15% of it) but never less than 14 or more than 30, so a
+// 90-day filter warns ~14 days out while a 2-year battery warns closer to 30.
+function soonWindowDays(lifespanDays) {
+return Math.min(30, Math.max(14, Math.round(lifespanDays * 0.15)));
+}
+
+function installationInfo(installation, lifespanDays) {
+if (!lifespanDays || !installation.installDate) {
+return { replaceByLabel: null, status: "none" };
+}
+const replaceBy = addDays(installation.installDate, lifespanDays);
+const today = new Date();
+today.setHours(0, 0, 0, 0);
+const daysLeft = Math.round((replaceBy - today) / 86400000);
+let status = "ok";
+if (daysLeft < 0) status = "overdue";
+else if (daysLeft <= soonWindowDays(lifespanDays)) status = "soon";
+return { replaceByLabel: formatDate(replaceBy), status, daysLeft };
+}
+
+// Shelf-life fallback for items that aren't tracked at any install location —
+// e.g. spare batteries or filters still sitting in a drawer. Uses the date the
+// item was added to inventory as the clock start, same math as installationInfo.
+function itemLifespanInfo(item) {
+if (!item.typicalLifespanDays || !item.addedAt) return { replaceByLabel: null, status: "none" };
+const addedDateStr = item.addedAt.slice(0, 10);
+return installationInfo({ installDate: addedDateStr }, item.typicalLifespanDays);
+}
+
+// Walks every item's tracked installations and pulls out the ones that are
+// overdue or coming due soon, across the whole inventory — for the
+
+// "coming up" panel at the top of the shelf. Items with no installation
+// tracked fall back to shelf-life-since-added so consumables still surface.
+function getUpcomingReplacements(items) {
+const rows = [];
+items.forEach((item) => {
+if (item.status !== "ready") return;
+const installations = item.installations || [];
+if (installations.length > 0) {
+installations.forEach((inst) => {
+const info = installationInfo(inst, item.typicalLifespanDays);
+if (info.status === "soon" || info.status === "overdue") {
+rows.push({
+itemId: item.id,
+itemName: item.name,
+location: inst.location,
+status: info.status,
+daysLeft: info.daysLeft,
+replaceByLabel: info.replaceByLabel
+});
+}
+});
+} else {
+const info = itemLifespanInfo(item);
+if (info.status === "soon" || info.status === "overdue") {
+rows.push({
+itemId: item.id,
+itemName: item.name,
+location: "On shelf",
+status: info.status,
+daysLeft: info.daysLeft,
+replaceByLabel: info.replaceByLabel
+});
+
+}
+}
+});
+rows.sort((a, b) => a.daysLeft - b.daysLeft);
+return rows;
+}
+
+// Reduces an item down to a single "how much life is left" reading for the
+// battery bar on its shelf card: the soonest-due tracked installation, or
+// the shelf-life-since-added fallback when nothing is installed anywhere.
+function getLifespanProgress(item) {
+const lifespanDays = item.typicalLifespanDays;
+if (!lifespanDays) return null;
+const installations = item.installations || [];
+let info = null;
+if (installations.length > 0) {
+installations.forEach((inst) => {
+const i = installationInfo(inst, lifespanDays);
+if (i.status === "none") return;
+if (!info || i.daysLeft < info.daysLeft) info = i;
+});
+} else {
+const i = itemLifespanInfo(item);
+if (i.status !== "none") info = i;
+}
+if (!info) return null;
+const fraction = Math.max(0, Math.min(1, info.daysLeft / lifespanDays));
+return { fraction, daysLeft: info.daysLeft, status: info.status };
+}
+
+function skuFromName(name) {
+let hash = 0;
+
+for (let i = 0; i < name.length; i++) {
+hash = (hash << 5) - hash + name.charCodeAt(i);
+hash |= 0;
+}
+return "SK" + Math.abs(hash).toString(36).toUpperCase().slice(0, 6);
+}
+
+function looksLikeUrl(text) {
+return /^https?:\/\/\S+$/i.test(text.trim());
+}
+
+function extractJsonBlock(textBlocks) {
+const cleaned = textBlocks.replace(/```json/g, "").replace(/```/g, "").trim();
+return cleaned;
+}
+
+// Coerces a value that should be numeric into a real number. The lookup
+// model sometimes returns price_value / rating / rating_count / typical_lifespan_days
+// as a string (e.g. "10.99" or "12,400") even when it clearly found the listing —
+// a strict `typeof === "number"` check was silently discarding those as unknown
+// even though the source was fine. This accepts numbers and numeric strings
+// (stripping a leading "$", thousands separators, or trailing text) and returns
+// null for anything that truly isn't a number.
+function toNumber(v) {
+if (typeof v === "number" && !Number.isNaN(v)) return v;
+if (typeof v === "string") {
+const n = parseFloat(v.replace(/[^0-9.\-]/g, ""));
+return Number.isNaN(n) ? null : n;
+}
+return null;
+}
+
+const PRODUCT_JSON_SHAPE = `{
+"name": "short everyday name for the item, 1-3 words",
+"category": "specific product-level category name",
+"description": "what it is, under 10 words, no full sentence needed",
+"typical_lifespan": "short phrase on how long it lasts or how often to replace it",
+"typical_lifespan_days": 90,
+"listing_url": "the literal URL of the ONE specific product listing page you fetched — this is the page the customer will be sent to buy the item, and the only page price/rating below may come from. Null only if no specific listing could be found at all.",
+"price_estimate": "short phrase with the exact current price you found on listing_url, like '$11.98 for a 20-pack'",
+"price_value": 10.5,
+"price_source": "the exact retailer name for listing_url, e.g. 'Amazon' or 'Home Depot', or null",
+"warranty": "the manufacturer warranty length, e.g. '1-year limited warranty' or 'Lifetime warranty', researched from the manufacturer's own site or product listing",
+"rating": 4.3,
+"rating_count": 12400,
+"rating_summary": "what reviewers say, under 8 words, no full sentence needed",
+"alternatives": [{"name": "alternative product name", "reason": "short reason someone might switch", "url": "the literal URL of a real listing page for this alternative, or null"}],
+"store": "store name if known from the input, else your best guess"
+}`;
+
+const PRODUCT_JSON_RULES = `name: short everyday shelf label, 1-3 words, title case, no brand/size/model (e.g. "Air Filter" not "Filtrete 20x25x1 MERV 11 Allergen Reduction Air Filter, 4-Pack"). Put brand/size details in "description" instead.
+category: the specific, concrete product type, 1-3 words, title case (e.g. "Sponges" not "Cleaning Supplies"). Can match "name".
+
+Budget: do ONE web_search, then ONE web_fetch on the best specific-listing result (prefer Amazon, Home Depot, Lowe's, Target, Walmart, Best Buy, else the manufacturer's site). That fetched URL is listing_url. Read the price/rating literally shown on the fetched page first — that number always wins. Only if the fetched page's content genuinely contains no visible price or no visible rating at all (common on JS-heavy pages) may you fall back to the number shown in the web_search snippet for that SAME listing_url. Never blend, average, or adjust between the two numbers, and never prefer the snippet over a number the fetched page actually shows. Only do a second fetch if the first result is clearly the wrong product — never fetch a third time.
+
+price_value: exact numeric price on listing_url, no symbol, no rounding, no averaging across sites. price_estimate: short display string from that number (e.g. "$11.98 for a 20-pack"). price_source: the retailer name for listing_url.
+rating/rating_count: exact star rating and review count shown on listing_url, as-is (rating_count null if not shown there).
+warranty: from the manufacturer's site or listing spec; null only for product types that never carry one (batteries, filters, consumables). typical_lifespan_days: integer days until replacement is typically needed, or null if not applicable.
+
+alternatives: up to 3 real, findable substitute products, each with a specific concrete reason (price/durability/size/etc, not "some prefer this") and a real listing URL or null. Empty array if none found — never invent one.
+
+Respond with nothing but that JSON object — no markdown fences, no preamble, no extra commentary.`;
+
+async function callClaude(query) {
+
+const isUrl = looksLikeUrl(query);
+const system = `You are a product research assistant for a home inventory app. Given a ${isUrl ? "URL pointing to a product page" : "short product description typed by a user (name, brand, and optionally the store where they bought it)"}, research the product using web search and respond with ONLY a single JSON object, no markdown code fences, no preamble, no explanation, matching exactly this shape:
+
+${PRODUCT_JSON_SHAPE}
+
+${isUrl ? `The input is a URL. You cannot open it directly, so use web search on the URL text itself, the product slug within it, and the domain/store it belongs to (e.g. amazon.com, homedepot.com, target.com) to figure out exactly which product it points to, then research that product normally. If you truly cannot determine the product from the URL alone, make your best-effort guess from the slug and note the uncertainty in "description" rather than refusing.\n\n` : ""}${PRODUCT_JSON_RULES}`;
+
+const response = await fetch("/.netlify/functions/product-lookup", {
+method: "POST",
+headers: { "Content-Type": "application/json" },
+body: JSON.stringify({
+model: "claude-sonnet-4-6",
+max_tokens: 8192,
+system,
+messages: [{ role: "user", content: query }],
+tools: [
+{ type: "web_search_20250305", name: "web_search" },
+{ type: "web_fetch_20250910", name: "web_fetch", max_uses: 4 }
+]
+})
+});
+
+if (!response.ok) {
+throw new Error("Lookup failed (" + response.status + ")");
+}
+
+const data = await response.json();
+const textBlocks = (data.content || [])
+.filter((b) => b.type === "text")
+.map((b) => b.text)
+.join("\n");
+
+const cleaned = extractJsonBlock(textBlocks);
+const start = cleaned.indexOf("{");
+const end = cleaned.lastIndexOf("}");
+if (start === -1 || end === -1) {
+throw new Error("Couldn't read a result for that item");
+}
+try {
+return JSON.parse(cleaned.slice(start, end + 1));
+} catch (parseErr) {
+// Most likely cause: the response got cut off mid-JSON before it
+// finished (e.g. ran out of tokens after tool calls). Surface a
+// clear, actionable message instead of the raw parser error.
+throw new Error("Got an incomplete response for that item — try again");
+}
+}
+
+// Identify + research a product from a screenshot. Two-step in one call:
+// the model looks at the image, figures out what product it shows, then
+// uses web search to research that product and returns the same JSON shape.
+async function callClaudeWithImage(base64Data, mediaType) {
+const system = `You are a product research assistant for a home inventory app. The user will send you a screenshot of a product — from a store listing, a search result, a photo of the item or its packaging, etc. First identify the specific product shown (name and brand, and the store if visible), then research it using web search, and respond with ONLY a single JSON object, no markdown code fences, no preamble, no explanation, matching exactly this shape:
+
+${PRODUCT_JSON_SHAPE}
+
+If the screenshot doesn't clearly show enough to identify an exact product, make your best specific guess based on what's visible (packaging text, logos, shape) rather than a vague generic guess, and mention the uncertainty briefly in "description".
+
+${PRODUCT_JSON_RULES}`;
+
+const response = await fetch("/.netlify/functions/product-lookup", {
+method: "POST",
+headers: { "Content-Type": "application/json" },
+body: JSON.stringify({
+
+model: "claude-sonnet-4-6",
+max_tokens: 8192,
+system,
+messages: [
+{
+role: "user",
+content: [
+{ type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } },
+{ type: "text", text: "Identify this product and research it." }
+]
+}
+],
+tools: [
+{ type: "web_search_20250305", name: "web_search" },
+{ type: "web_fetch_20250910", name: "web_fetch", max_uses: 4 }
+]
+})
+});
+
+if (!response.ok) {
+throw new Error("Lookup failed (" + response.status + ")");
+}
+
+const data = await response.json();
+const textBlocks = (data.content || [])
+.filter((b) => b.type === "text")
+.map((b) => b.text)
+.join("\n");
+
+const cleaned = extractJsonBlock(textBlocks);
+const start = cleaned.indexOf("{");
+const end = cleaned.lastIndexOf("}");
+
+if (start === -1 || end === -1) {
+throw new Error("Couldn't recognize a product in that screenshot");
+}
+try {
+return JSON.parse(cleaned.slice(start, end + 1));
+} catch (parseErr) {
+throw new Error("Got an incomplete response for that screenshot — try again");
+}
+}
+
+function looksLikeRealUrl(u) {
+return typeof u === "string" && /^https?:\/\/\S+$/i.test(u.trim());
+}
+
+// Guards against hallucinated or malformed ratings: only accept a numeric
+// value (or numeric string, see toNumber) in the valid 1-5 range, backed by
+// BOTH a named source and a literal, checkable URL for the specific page it
+// came from. A site name with no real URL behind it is exactly the pattern
+// that let mismatched/incorrect ratings through before, so it's treated the
+// same as no rating at all.
+//
+// The review count gets the same treatment, as its own field: previously the
+// count only ever showed up folded into the free-text rating_source string
+// (e.g. "Amazon, 12,400 ratings"), which the model composed itself and which
+// was never checked against anything — so a wrong or made-up number could
+// slip straight through unnoticed. rating_count is now a separate value that
+// only survives sanitization when it's a real non-negative number, and it's
+// only trusted at all alongside the same verified rating + source URL the
+// star rating requires.
+function sanitizeRating(info, listingUrl) {
+const r = toNumber(info.rating);
+if (r == null || r < 1 || r > 5 || !listingUrl) {
+
+return { rating: null, ratingCount: null, ratingSource: null, ratingSourceUrl: null };
+}
+const countRaw = toNumber(info.rating_count);
+const ratingCount = countRaw != null && countRaw >= 0 ? Math.round(countRaw) : null;
+return {
+rating: Math.round(r * 10) / 10,
+ratingCount,
+ratingSource: info.price_source || info.store || null,
+ratingSourceUrl: listingUrl
+};
+}
+
+// Same idea as sanitizeRating: a price with no real, specific listing URL
+// behind it is treated as unknown rather than shown, so nothing on screen
+// is a guess dressed up with a plausible retailer name. price and rating
+// are both pinned to the SAME listingUrl the customer gets sent to buy
+// from, rather than trusting the model to repeat a matching URL per field.
+function sanitizePrice(info, listingUrl) {
+const v = toNumber(info.price_value);
+const src = info.price_source;
+if (v == null || v < 0 || !src || !listingUrl) {
+return { priceValue: null, priceSource: null, priceSourceUrl: null, priceEstimate: null };
+}
+return { priceValue: v, priceSource: src, priceSourceUrl: listingUrl, priceEstimate: info.price_estimate || null };
+}
+
+// Same no-URL-no-trust rule as price/rating, applied per alternative: keep
+// the name and reason either way (still useful on their own) but only keep
+// a clickable url when it's a real, well-formed link — never a guessed one.
+function sanitizeAlternatives(alts) {
+if (!Array.isArray(alts)) return [];
+return alts.slice(0, 3).map((alt) => ({
+
+name: alt && alt.name ? String(alt.name) : "",
+reason: alt && alt.reason ? String(alt.reason) : "",
+url: alt && looksLikeRealUrl(alt.url) ? alt.url.trim() : null
+})).filter((alt) => alt.name);
+}
+
+function fileToBase64(file) {
+return new Promise((resolve, reject) => {
+const reader = new FileReader();
+reader.onload = () => resolve(reader.result.split(",")[1]);
+reader.onerror = () => reject(new Error("Couldn't read that image"));
+reader.readAsDataURL(file);
+});
+}
+
+function Stars({ rating }) {
+if (rating == null) return <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>No rating found</span>;
+const full = Math.round(rating);
+return (
+<span style={{ fontFamily: "var(--mono)", fontSize: 13, letterSpacing: 1 }}>
+{"★".repeat(full)}
+<span style={{ opacity: 0.25 }}>{"★".repeat(5 - full)}</span>
+<span style={{ marginLeft: 6, fontSize: 12, color: "var(--ink-soft)" }}>{rating.toFixed(1)}</span>
+</span>
+);
+}
+
+// Formats a verified review count for display, e.g. 12400 -> "12,400 ratings".
+function formatRatingCount(count) {
+if (count == null) return null;
+return count.toLocaleString() + (count === 1 ? " rating" : " ratings");
+}
+
+// Small battery-style indicator of how much life a product has left before
+// it's due for replacement. Only renders when the item has a lifespan and a
+// clock actually started (installed somewhere, or sitting on the shelf).
+function LifespanBar({ progress }) {
+if (!progress) return null;
+const pct = Math.round(progress.fraction * 100);
+const color =
+progress.status === "overdue" ? "var(--rust)" :
+progress.status === "soon" ? "var(--amber-dark)" :
+"var(--sage)";
+const label =
+progress.daysLeft < 0 ? "Overdue" :
+progress.daysLeft === 0 ? "Due today" :
+progress.daysLeft + "d left";
+const fillWidth = Math.max(0, Math.round(15 * progress.fraction));
+return (
+<div className="lifespanRow" title={pct + "% of lifespan remaining"}>
+<svg width="20" height="11" viewBox="0 0 20 11" style={{ flexShrink: 0 }}>
+<rect x="0.5" y="0.5" width="17" height="10" rx="1.5" fill="none" stroke="var(--ink-soft)" strokeWidth="1" />
+<rect x="18" y="3" width="1.5" height="5" rx="0.5" fill="var(--ink-soft)" />
+<rect x="2" y="2" width={fillWidth} height="7" rx="0.5" fill={color} />
+</svg>
+<span className="lifespanLabel mono" style={{ color }}>{label}</span>
+</div>
+);
+}
+
+function Barcode({ seed }) {
+const bars = barcodeBars(seed);
+return (
+<svg width="120" height="28" viewBox="0 0 120 28" style={{ display: "block" }}>
+
+{(() => {
+let x = 0;
+return bars.map((w, i) => {
+const bar = i % 2 === 0 ? (
+<rect key={i} x={x} y={0} width={w} height={22} fill="var(--ink)" />
+) : null;
+x += w;
+return bar;
+});
+})()}
+</svg>
+);
+}
+
+// --- Shelf grid card: just a browsing preview, click opens the detail page ---
+function Card({ item, onOpen, onRefresh, onRemove }) {
+const rotation = useRef(seededRotation(item.id)).current;
+
+if (item.status === "loading") {
+return (
+<div className="shelfUnit">
+<div className="tag" style={{ "--rot": "0deg" }}>
+<div className="hole" />
+<p className="loadingText">Reading the label…</p>
+{!looksLikeUrl(item.query || "") && <p className="loadingSub">{item.query}</p>}
+</div>
+<div className="box loadingBox" />
+<div className="shelfPlank">
+<span className="shelfBracket left" />
+<span className="shelfBracket right" />
+</div>
+</div>
+
+);
+}
+
+if (item.status === "error") {
+return (
+<div className="shelfUnit">
+<div className="tag" style={{ "--rot": rotation + "deg" }}>
+<div className="hole" />
+<p className="loadingText" style={{ color: "var(--rust)" }}>Couldn't look this up</p>
+<p className="loadingSub">{item.errorMessage || item.query}</p>
+<div className="row" style={{ marginTop: 10, gap: 8 }}>
+<button className="btnSmall" onClick={() => onRefresh(item.id)}>Try again</button>
+<button className="btnSmall" onClick={() => onRemove(item.id)}>Remove</button>
+</div>
+</div>
+<div className="box errorBox" />
+<div className="shelfPlank">
+<span className="shelfBracket left" />
+<span className="shelfBracket right" />
+</div>
+</div>
+);
+}
+
+const lowStock = item.quantity <= 1;
+const catColor = getCategoryColor(item.category);
+const lifespanProgress = getLifespanProgress(item);
+const installations = item.installations || [];
+let worstStatus = null;
+if (installations.length > 0) {
+const installStatuses = installations.map((inst) => installationInfo(inst, item.typicalLifespanDays).status);
+worstStatus = installStatuses.includes("overdue") ? "overdue" : installStatuses.includes("soon") ? "soon" : null;
+
+} else {
+const shelfStatus = itemLifespanInfo(item).status;
+worstStatus = shelfStatus === "overdue" ? "overdue" : shelfStatus === "soon" ? "soon" : null;
+}
+
+return (
+<div className="shelfUnit">
+<div className="tag" style={{ "--rot": rotation + "deg" }}>
+<div className="hole" />
+<div className="tagTop">
+<span className="badge" style={{ background: catColor.bg, color: catColor.text }}>
+{item.category}
+</span>
+{lowStock && <span className="badge lowBadge">Low stock</span>}
+{worstStatus === "overdue" && <span className="badge lowBadge">Replace overdue</span>}
+{worstStatus === "soon" && <span className="badge soonBadge">Replace soon</span>}
+</div>
+<h3 className="itemName">{item.name}</h3>
+<div className="row" style={{ justifyContent: "space-between", marginTop: 8 }}>
+<Stars rating={item.rating} />
+<span className="mono priceTag">{item.priceEstimate || "Price unknown"}</span>
+</div>
+<LifespanBar progress={lifespanProgress} />
+</div>
+
+<div
+className="box"
+onClick={() => onOpen(item.id)}
+role="button"
+tabIndex={0}
+aria-label={"Open " + item.name}
+onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(item.id); } }}
+
+>
+<div className="boxTape" />
+<span className="openHint">View details ›</span>
+</div>
+
+<div className="shelfPlank">
+<span className="shelfBracket left" />
+<span className="shelfBracket right" />
+</div>
+</div>
+);
+}
+
+// --- Detail page: clean, modern, spaced out, no shelf/box motif ---
+function DetailPage({ item, onBack, onUpdate, onRemove, onRefresh }) {
+const [addingInstall, setAddingInstall] = useState(false);
+const [installLocation, setInstallLocation] = useState("");
+const [installDate, setInstallDate] = useState(new Date().toISOString().slice(0, 10));
+
+const installations = item.installations || [];
+
+const addInstallation = () => {
+const loc = installLocation.trim();
+if (!loc || !installDate) return;
+const next = [
+...installations,
+{ id: "inst_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6), location: loc, installDate }
+];
+onUpdate(item.id, { installations: next });
+setInstallLocation("");
+setInstallDate(new Date().toISOString().slice(0, 10));
+setAddingInstall(false);
+
+};
+
+const removeInstallation = (instId) => {
+onUpdate(item.id, { installations: installations.filter((i) => i.id !== instId) });
+};
+
+const facts = [
+item.typicalLifespan ? ["Lifespan", item.typicalLifespan] : null,
+item.warranty ? ["Warranty", item.warranty] : null,
+item.store ? ["Store", item.store] : null
+].filter(Boolean);
+
+const ratingCountLabel = formatRatingCount(item.ratingCount);
+
+return (
+<div className="detailPage">
+<button className="backLink" onClick={onBack}>← Back to shelf</button>
+
+<div className="detailHead">
+<span className="detailCategory">{item.category}</span>
+<h1 className="detailName">{item.name}</h1>
+<div className="detailMetaRow">
+<Stars rating={item.rating} />
+<span className="detailPrice">{item.priceEstimate || "Price unknown"}</span>
+</div>
+{((item.rating != null && item.ratingSource) || (item.priceValue != null && item.priceSource)) && (
+<p className="mutedLine" style={{ marginTop: 6 }}>
+{item.rating != null && item.ratingSource ? (
+item.ratingSourceUrl ? (
+<>Rating: <a className="verifyLink" href={item.ratingSourceUrl} target="_blank" rel="noreferrer">
+{item.ratingSource}{ratingCountLabel ? " · " + ratingCountLabel : ""} ↗
+</a></>
+
+) : "Rating: " + item.ratingSource + (ratingCountLabel ? " · " + ratingCountLabel : "")
+) : null}
+{item.rating != null && item.ratingSource && item.priceValue != null && item.priceSource ? " · " : null}
+{item.priceValue != null && item.priceSource ? (
+item.priceSourceUrl ? (
+<>Price: <a className="verifyLink" href={item.priceSourceUrl} target="_blank" rel="noreferrer">{item.priceSource} ↗</a></>
+) : "Price: " + item.priceSource
+) : null}
+</p>
+)}
+{item.ratingSummary && <p className="detailReview">"{item.ratingSummary}"</p>}
+</div>
+
+{item.description && <p className="detailDesc">{item.description}</p>}
+
+<div className="detailSection">
+<div className="qtyRow">
+<span className="detailLabel">On hand</span>
+<div className="row" style={{ gap: 10 }}>
+<button className="stepBtn" onClick={() => onUpdate(item.id, { quantity: Math.max(0, item.quantity - 1) })}>−</button>
+<span className="mono qty">{item.quantity}</span>
+<button className="stepBtn" onClick={() => onUpdate(item.id, { quantity: item.quantity + 1 })}>+</button>
+</div>
+</div>
+</div>
+
+{facts.length > 0 && (
+<div className="detailSection">
+<dl className="factList">
+{facts.map(([label, value]) => (
+<div className="factRow" key={label}>
+<dt>{label}</dt>
+
+<dd>{value}</dd>
+</div>
+))}
+</dl>
+</div>
+)}
+
+<div className="detailSection">
+<div className="sectionHeadRow">
+<span className="detailLabel">Installed where</span>
+<button className="locBtn" onClick={() => setAddingInstall((v) => !v)}>
+{addingInstall ? "Cancel" : "+ Add location"}
+</button>
+</div>
+
+{installations.length === 0 && !addingInstall && (() => {
+const shelfInfo = itemLifespanInfo(item);
+if (shelfInfo.replaceByLabel) {
+return (
+<p className="mutedLine">
+Not tracked at a location.{" "}
+<span className={"replaceBadge " + shelfInfo.status} style={{ marginLeft: 4 }}>
+{shelfInfo.status === "overdue" ? "Shelf life up since " : "Estimated replace by "}
+{shelfInfo.replaceByLabel}
+</span>
+</p>
+);
+}
+return <p className="mutedLine">Not tracked at a location yet.</p>;
+})()}
+
+{installations.map((inst) => {
+
+const info = installationInfo(inst, item.typicalLifespanDays);
+return (
+<div className="installRow" key={inst.id}>
+<div>
+<span className="installLoc">{inst.location}</span>
+<span className="installDate mono"> · installed {formatDate(new Date(inst.installDate + "T00:00:00"))}</span>
+</div>
+<div className="row" style={{ gap: 8 }}>
+{info.replaceByLabel && (
+<span className={"replaceBadge " + info.status}>
+{info.status === "overdue" ? "Overdue since " : "Replace by "}
+{info.replaceByLabel}
+</span>
+)}
+<button className="removeInstBtn" onClick={() => removeInstallation(inst.id)} aria-label="Remove installation">×</button>
+</div>
+</div>
+);
+})}
+
+{addingInstall && (
+<div className="installForm">
+<input
+className="locInput"
+value={installLocation}
+onChange={(e) => setInstallLocation(e.target.value)}
+placeholder="e.g. living room"
+style={{ width: "100%", marginBottom: 8 }}
+/>
+<div className="row" style={{ gap: 8 }}>
+<input
+type="date"
+
+className="dateInput"
+value={installDate}
+onChange={(e) => setInstallDate(e.target.value)}
+/>
+<button className="btnSmall" onClick={addInstallation}>Add</button>
+</div>
+</div>
+)}
+</div>
+
+{item.alternatives && item.alternatives.length > 0 && (
+<div className="detailSection">
+<span className="detailLabel">Could swap for</span>
+<div className="chipRow">
+{item.alternatives.map((alt, i) =>
+alt.url ? (
+<a className="chip chipLink" key={i} title={alt.reason} href={alt.url} target="_blank" rel="noreferrer">
+{alt.name} ↗
+</a>
+) : (
+<span className="chip" key={i} title={alt.reason}>{alt.name}</span>
+)
+)}
+</div>
+</div>
+)}
+
+<div className="detailActions">
+{item.purchaseLink && (
+<a className="btnSmall linkBtn" href={item.purchaseLink} target="_blank" rel="noreferrer">
+Where to buy
+</a>
+
+)}
+<button className="btnSmall" onClick={() => { onRefresh(item.id); onBack(); }}>Refresh info</button>
+<button className="btnSmall dangerBtn" onClick={() => { onRemove(item.id); onBack(); }}>Remove item</button>
+</div>
+
+<div className="detailFooter">
+<Barcode seed={item.sku} />
+<span className="mono skuText">{item.sku}</span>
+</div>
+</div>
+);
+}
+
+function Stockroom() {
+const [items, setItems] = useState([]);
+const [inputValue, setInputValue] = useState("");
+const [loaded, setLoaded] = useState(false);
+const [filter, setFilter] = useState("All");
+const [lowStockOnly, setLowStockOnly] = useState(false);
+const [needsReplacingOnly, setNeedsReplacingOnly] = useState(false);
+const [openItemId, setOpenItemId] = useState(null);
+const [screenshotError, setScreenshotError] = useState(null);
+const fileInputRef = useRef(null);
+
+useEffect(() => {
+(async () => {
+try {
+const result = await window.storage.get("inventory_items", false);
+if (result && result.value) {
+const parsed = JSON.parse(result.value);
+// Fix: items saved before the lifespan feature existed have no
+// addedAt, so their shelf-life clock never started and the
+
+// lifespan bar silently never rendered for them. Backfill it
+// from lastRefreshed (or now, as a last resort) on load.
+const backfilled = parsed.map((it) =>
+it.addedAt ? it : { ...it, addedAt: it.lastRefreshed || new Date().toISOString() }
+);
+setItems(backfilled);
+}
+} catch (e) {
+// no existing data yet
+} finally {
+setLoaded(true);
+}
+})();
+}, []);
+
+const persist = async (next) => {
+setItems(next);
+try {
+await window.storage.set("inventory_items", JSON.stringify(next), false);
+} catch (e) {
+console.error("Storage error", e);
+}
+};
+
+const runLookup = async (id, query) => {
+try {
+const info = await callClaude(query);
+const listingUrl = looksLikeRealUrl(info.listing_url) ? info.listing_url.trim() : null;
+const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, listingUrl);
+const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, listingUrl);
+setItems((prev) => {
+const next = prev.map((it) => {
+
+if (it.id !== id) return it;
+return {
+...it,
+status: "ready",
+name: info.name,
+category: info.category || "Household",
+description: info.description,
+typicalLifespan: info.typical_lifespan,
+typicalLifespanDays: toNumber(info.typical_lifespan_days),
+priceEstimate,
+priceValue,
+priceSource,
+priceSourceUrl,
+warranty: info.warranty || null,
+purchaseLink: listingUrl,
+rating,
+ratingCount,
+ratingSource,
+ratingSourceUrl,
+ratingSummary: info.rating_summary,
+alternatives: sanitizeAlternatives(info.alternatives),
+store: info.store || it.store,
+sku: skuFromName(info.name || query),
+lastRefreshed: new Date().toISOString()
+};
+});
+window.storage.set("inventory_items", JSON.stringify(next), false).catch(() => {});
+return next;
+});
+} catch (e) {
+setItems((prev) => {
+const next = prev.map((it) =>
+
+it.id === id ? { ...it, status: "error", errorMessage: e.message } : it
+);
+window.storage.set("inventory_items", JSON.stringify(next), false).catch(() => {});
+return next;
+});
+}
+};
+
+// Runs the image-based lookup instead of the text-based one, otherwise
+// follows the exact same loading/ready/error lifecycle as runLookup.
+const runImageLookup = async (id, base64Data, mediaType) => {
+try {
+const info = await callClaudeWithImage(base64Data, mediaType);
+const listingUrl = looksLikeRealUrl(info.listing_url) ? info.listing_url.trim() : null;
+const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, listingUrl);
+const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, listingUrl);
+setItems((prev) => {
+const next = prev.map((it) => {
+if (it.id !== id) return it;
+return {
+...it,
+status: "ready",
+name: info.name,
+category: info.category || "Household",
+description: info.description,
+typicalLifespan: info.typical_lifespan,
+typicalLifespanDays: toNumber(info.typical_lifespan_days),
+priceEstimate,
+priceValue,
+priceSource,
+priceSourceUrl,
+warranty: info.warranty || null,
+
+purchaseLink: listingUrl,
+rating,
+ratingCount,
+ratingSource,
+ratingSourceUrl,
+ratingSummary: info.rating_summary,
+alternatives: sanitizeAlternatives(info.alternatives),
+store: info.store || it.store,
+sku: skuFromName(info.name || "screenshot"),
+lastRefreshed: new Date().toISOString()
+};
+});
+window.storage.set("inventory_items", JSON.stringify(next), false).catch(() => {});
+return next;
+});
+} catch (e) {
+setItems((prev) => {
+const next = prev.map((it) =>
+it.id === id ? { ...it, status: "error", errorMessage: e.message } : it
+);
+window.storage.set("inventory_items", JSON.stringify(next), false).catch(() => {});
+return next;
+});
+}
+};
+
+const addPlaceholder = (query) => {
+const id = "item_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+const newItem = {
+id,
+query,
+status: "loading",
+
+quantity: 1,
+installations: [],
+addedAt: new Date().toISOString()
+};
+const next = [newItem, ...items];
+persist(next);
+return id;
+};
+
+const handleAdd = () => {
+const query = inputValue.trim();
+if (!query) return;
+const id = addPlaceholder(query);
+setInputValue("");
+runLookup(id, query);
+};
+
+const handleScreenshotSelected = async (e) => {
+const file = e.target.files && e.target.files[0];
+e.target.value = "";
+if (!file) return;
+if (!file.type.startsWith("image/")) {
+setScreenshotError("That file isn't an image.");
+return;
+}
+setScreenshotError(null);
+try {
+const base64 = await fileToBase64(file);
+const id = addPlaceholder("Screenshot: " + file.name);
+runImageLookup(id, base64, file.type);
+} catch (err) {
+setScreenshotError(err.message);
+
+}
+};
+
+const handleUpdate = (id, patch) => {
+const next = items.map((it) => (it.id === id ? { ...it, ...patch } : it));
+persist(next);
+};
+
+const handleRemove = (id) => {
+const next = items.filter((it) => it.id !== id);
+persist(next);
+};
+
+const handleRefresh = (id) => {
+const item = items.find((it) => it.id === id);
+if (!item) return;
+const next = items.map((it) => (it.id === id ? { ...it, status: "loading" } : it));
+persist(next);
+runLookup(id, item.query);
+};
+
+const openItem = openItemId ? items.find((it) => it.id === openItemId) : null;
+
+if (openItem) {
+return (
+<div className="stockroomRoot">
+<style>{SHARED_STYLES}</style>
+<DetailPage
+item={openItem}
+onBack={() => setOpenItemId(null)}
+onUpdate={handleUpdate}
+onRemove={handleRemove}
+
+onRefresh={handleRefresh}
+/>
+</div>
+);
+}
+
+const categories = ["All", ...Array.from(new Set(items.filter(i => i.category).map((i) => i.category)))];
+const upcoming = getUpcomingReplacements(items);
+const visibleItems = items.filter((it) => {
+if (filter !== "All" && it.category !== filter) return false;
+if (lowStockOnly && !(it.status === "ready" && it.quantity <= 1)) return false;
+if (needsReplacingOnly) {
+const installs = it.installations || [];
+const anyDue = installs.some((inst) => {
+const s = installationInfo(inst, it.typicalLifespanDays).status;
+return s === "soon" || s === "overdue";
+});
+if (!anyDue) return false;
+}
+return true;
+});
+
+return (
+<div className="stockroomRoot">
+<style>{SHARED_STYLES}</style>
+
+<div className="header">
+<div>
+<p className="headerTitle">Stockroom</p>
+<p className="headerSub">Type a product, paste a link, or upload a screenshot</p>
+</div>
+<span className="itemCount">{items.length} item{items.length === 1 ? "" : "s"}</span>
+
+</div>
+
+<div className="addRow">
+<input
+className="addInput"
+value={inputValue}
+onChange={(e) => setInputValue(e.target.value)}
+onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }}
+placeholder="Duracell AA batteries from Home Depot, or paste a product link"
+/>
+<button
+className="cameraBtn"
+onClick={() => fileInputRef.current && fileInputRef.current.click()}
+title="Add from a screenshot"
+aria-label="Add from a screenshot"
+>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M4 8.5C4 7.67157 4.67157 7 5.5 7H7.5L8.5 5H15.5L16.5 7H18.5C19.3284 7 20 7.67157 20 8.5V17.5C20 18.3284 19.3284 19 18.5 19H5.5C4.67157 19 4 18.3284 4 17.5V8.5Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"/>
+<circle cx="12" cy="13" r="3.2" stroke="currentColor" strokeWidth="1.6"/>
+</svg>
+</button>
+<input
+ref={fileInputRef}
+type="file"
+accept="image/*"
+style={{ display: "none" }}
+onChange={handleScreenshotSelected}
+/>
+<button className="addBtn" onClick={handleAdd}>Add</button>
+</div>
+{screenshotError && <p className="fieldError">{screenshotError}</p>}
+
+{upcoming.length > 0 && (
+<div className="upcomingPanel">
+<p className="upcomingTitle">Coming up for replacement</p>
+<div className="upcomingList">
+{upcoming.map((row, i) => (
+<button
+key={i}
+className="upcomingRow"
+onClick={() => setOpenItemId(row.itemId)}
+>
+<span className="upcomingName">{row.itemName}</span>
+<span className="upcomingLoc mono">{row.location}</span>
+<span className={"replaceBadge " + row.status}>
+{row.status === "overdue" ? "Overdue since " : "Due "}
+{row.replaceByLabel}
+</span>
+</button>
+))}
+</div>
+</div>
+)}
+
+{items.length > 0 && (
+<div className="filterRow">
+{categories.map((c) => (
+<button
+key={c}
+className={"filterChip" + (filter === c ? " active" : "")}
+onClick={() => setFilter(c)}
+>
+{c}
+</button>
+
+))}
+<button
+className={"filterChip" + (lowStockOnly ? " active" : "")}
+onClick={() => setLowStockOnly((v) => !v)}
+>
+Low stock only
+</button>
+{upcoming.length > 0 && (
+<button
+className={"filterChip" + (needsReplacingOnly ? " active" : "")}
+onClick={() => setNeedsReplacingOnly((v) => !v)}
+>
+Needs replacing
+</button>
+)}
+</div>
+)}
+
+{loaded && items.length === 0 && (
+<div className="emptyState">
+<h3>Empty shelf</h3>
+<p>Add your first item above to start tracking it.</p>
+</div>
+)}
+
+<div className="grid">
+{visibleItems.map((item) => (
+<Card
+key={item.id}
+item={item}
+onOpen={setOpenItemId}
+onRefresh={handleRefresh}
+
+onRemove={handleRemove}
+/>
+))}
+</div>
+</div>
+);
+}
+
+const SHARED_STYLES = `
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;900&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+.stockroomRoot {
+--paper: #EDE7DA;
+--paper-alt: #E4DCC9;
+--ink: #24261C;
+--ink-soft: #6B6858;
+--amber: #C98A2C;
+--amber-dark: #9C6A1E;
+--sage: #66795A;
+--sage-bg: #DCE3D3;
+--rust: #B54B34;
+--rust-bg: #F1D9CF;
+--kraft: #C8A874;
+--kraft-dark: #8B6F3E;
+--wood: #8B6A44;
+--wood-dark: #6E5334;
+--line: rgba(36,38,28,0.16);
+--mono: 'IBM Plex Mono', monospace;
+--display: 'Barlow Condensed', sans-serif;
+--sans: 'Inter', sans-serif;
+background:
+repeating-linear-gradient(90deg, rgba(36,38,28,0.03) 0 2px, transparent 2px 96px),
+
+var(--paper);
+color: var(--ink);
+font-family: var(--sans);
+padding: 28px 24px 48px;
+border-radius: 4px;
+min-height: 200px;
+}
+.stockroomRoot * { box-sizing: border-box; }
+
+.header {
+display: flex;
+justify-content: space-between;
+align-items: flex-end;
+border-bottom: 3px solid var(--ink);
+padding-bottom: 14px;
+margin-bottom: 20px;
+flex-wrap: wrap;
+gap: 10px;
+}
+.headerTitle {
+font-family: var(--display);
+font-weight: 900;
+text-transform: uppercase;
+letter-spacing: 1px;
+font-size: 34px;
+line-height: 1;
+margin: 0;
+}
+.headerSub {
+font-family: var(--mono);
+font-size: 12px;
+color: var(--ink-soft);
+
+margin: 4px 0 0;
+letter-spacing: 0.5px;
+}
+.itemCount {
+font-family: var(--mono);
+font-size: 13px;
+background: var(--ink);
+color: var(--paper);
+padding: 4px 10px;
+border-radius: 3px;
+}
+
+.addRow { display: flex; gap: 8px; margin-bottom: 8px; }
+.addInput {
+flex: 1;
+padding: 12px 14px;
+font-size: 14px;
+font-family: var(--sans);
+border: 1.5px solid var(--ink);
+border-radius: 4px;
+background: #fff;
+color: var(--ink);
+outline: none;
+}
+.addInput:focus {
+border-color: var(--amber-dark);
+box-shadow: 0 0 0 3px rgba(201,138,44,0.2);
+}
+.addBtn {
+font-family: var(--display);
+font-weight: 700;
+text-transform: uppercase;
+
+letter-spacing: 0.5px;
+font-size: 15px;
+padding: 0 20px;
+background: var(--amber);
+color: #2A1B04;
+border: 1.5px solid var(--ink);
+border-radius: 4px;
+cursor: pointer;
+transition: transform 0.1s ease, background 0.15s ease;
+}
+.addBtn:hover { background: var(--amber-dark); }
+.addBtn:active { transform: scale(0.97); }
+.addBtn:disabled { opacity: 0.5; cursor: default; }
+.cameraBtn {
+display: flex;
+align-items: center;
+justify-content: center;
+width: 46px;
+flex-shrink: 0;
+background: #fff;
+color: var(--ink-soft);
+border: 1.5px solid var(--ink);
+border-radius: 4px;
+cursor: pointer;
+transition: background 0.15s ease, color 0.15s ease;
+}
+.cameraBtn:hover { background: var(--paper-alt); color: var(--ink); }
+.cameraBtn:active { transform: scale(0.97); }
+.hint { font-size: 12px; color: var(--ink-soft); margin: 0 0 24px; }
+.fieldError { font-size: 12px; color: var(--rust); margin: 8px 0 0; }
+
+.upcomingPanel {
+
+border: 1.5px solid var(--rust);
+background: var(--rust-bg);
+border-radius: 6px;
+padding: 14px 16px;
+margin-bottom: 20px;
+}
+.upcomingTitle {
+font-family: var(--display);
+font-weight: 700;
+text-transform: uppercase;
+letter-spacing: 0.5px;
+font-size: 15px;
+color: var(--rust);
+margin: 0 0 8px;
+}
+.upcomingList { display: flex; flex-direction: column; gap: 2px; }
+.upcomingRow {
+display: flex;
+align-items: center;
+gap: 10px;
+width: 100%;
+text-align: left;
+background: none;
+border: none;
+border-radius: 4px;
+padding: 7px 6px;
+cursor: pointer;
+font-family: var(--sans);
+font-size: 13.5px;
+color: var(--ink);
+}
+.upcomingRow:hover { background: rgba(255,255,255,0.5); }
+
+.upcomingName { font-weight: 600; }
+.upcomingLoc { color: var(--ink-soft); font-size: 12px; flex: 1; }
+
+.filterRow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 24px; }
+.filterChip {
+font-family: var(--mono);
+font-size: 12px;
+padding: 5px 12px;
+border-radius: 20px;
+border: 1px solid var(--line);
+background: transparent;
+color: var(--ink-soft);
+cursor: pointer;
+}
+.filterChip.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+
+.grid {
+display: grid;
+grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+gap: 30px 22px;
+}
+
+.shelfUnit {
+display: flex;
+flex-direction: column;
+align-items: stretch;
+height: 100%;
+justify-content: flex-end;
+padding-top: 16px;
+}
+
+.tag {
+
+position: relative;
+background: #fff;
+border: 1.5px solid var(--ink);
+border-radius: 6px;
+padding: 18px 16px 14px;
+transform: rotate(var(--rot));
+transition: transform 0.25s ease, box-shadow 0.25s ease;
+box-shadow: 2px 2px 0 rgba(36,38,28,0.10);
+z-index: 3;
+}
+.shelfUnit:hover .tag { transform: rotate(0deg); box-shadow: 3px 4px 0 rgba(36,38,28,0.14); }
+.hole {
+position: absolute;
+top: -9px;
+left: 20px;
+width: 16px;
+height: 16px;
+background: var(--paper);
+border: 1.5px solid var(--ink);
+border-radius: 50%;
+}
+
+.box {
+position: relative;
+width: 82%;
+margin: -18px auto 0;
+height: 46px;
+background: linear-gradient(180deg, #D2B583, var(--kraft));
+border: 1.5px solid var(--kraft-dark);
+border-top: none;
+border-radius: 0 0 4px 4px;
+box-shadow: inset 0 6px 8px -4px rgba(139,111,62,0.5), 2px 3px 0 rgba(36,38,28,0.08);
+
+z-index: 1;
+cursor: pointer;
+display: flex;
+align-items: center;
+justify-content: center;
+transition: filter 0.15s ease, transform 0.15s ease;
+}
+.box:hover { filter: brightness(1.05); transform: translateY(-1px); }
+.box:hover .openHint { background: var(--ink); color: var(--paper); }
+.box:focus-visible { outline: 2px solid var(--amber-dark); outline-offset: 2px; }
+.box.loadingBox, .box.errorBox { cursor: default; opacity: 0.7; }
+.boxTape {
+position: absolute;
+top: -2px;
+bottom: -2px;
+left: 50%;
+width: 15px;
+transform: translateX(-50%);
+background: rgba(232,222,193,0.6);
+border-left: 1px dashed rgba(139,111,62,0.55);
+border-right: 1px dashed rgba(139,111,62,0.55);
+}
+.openHint {
+font-family: var(--mono);
+font-weight: 500;
+font-size: 11.5px;
+text-transform: uppercase;
+letter-spacing: 0.5px;
+color: var(--paper);
+background: var(--ink);
+padding: 6px 14px;
+border-radius: 20px;
+
+box-shadow: 0 2px 4px rgba(36,38,28,0.25);
+z-index: 2;
+transition: background 0.15s ease, color 0.15s ease;
+}
+
+.shelfPlank {
+position: relative;
+width: 108%;
+margin: 0 -4%;
+height: 13px;
+background: linear-gradient(180deg, #A9835A, var(--wood));
+border-radius: 2px;
+box-shadow: inset 0 1px 0 rgba(255,255,255,0.15), 0 6px 10px rgba(36,38,28,0.18);
+}
+.shelfPlank::before {
+content: "";
+position: absolute;
+inset: 0;
+border-radius: 2px;
+background: repeating-linear-gradient(90deg, rgba(0,0,0,0.06) 0 2px, transparent 2px 16px);
+}
+.shelfBracket { position: absolute; top: 100%; width: 5px; height: 16px; background: linear-gradient(180deg, var(--wood), var(--wood-dark)); }
+.shelfBracket.left { left: 14%; }
+.shelfBracket.right { right: 14%; }
+
+.loadingText { font-family: var(--display); font-size: 18px; font-weight: 700; margin: 10px 0 2px; }
+.loadingSub { font-size: 12px; color: var(--ink-soft); margin: 0; }
+
+.tagTop { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; margin-top: 4px; }
+.badge { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; padding: 3px 8px; border-radius: 3px; font-weight: 500; }
+.lowBadge { background: var(--rust-bg); color: var(--rust); }
+.soonBadge { background: #F5E7C4; color: var(--amber-dark); }
+
+.itemName { font-family: var(--display); font-size: 21px; font-weight: 900; text-transform: uppercase; line-height: 1.05; margin: 0 0 6px; }
+.mono { font-family: var(--mono); }
+.priceTag { font-size: 13px; font-weight: 500; background: var(--paper-alt); padding: 2px 8px; border-radius: 3px; }
+.row { display: flex; align-items: center; }
+.lifespanRow { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.lifespanLabel { font-size: 11px; }
+
+.btnSmall {
+font-family: var(--mono);
+font-size: 11.5px;
+padding: 7px 13px;
+border: 1.5px solid var(--ink);
+border-radius: 4px;
+background: #fff;
+color: var(--ink);
+cursor: pointer;
+text-decoration: none;
+display: inline-block;
+}
+.btnSmall:hover { background: var(--paper-alt); }
+.linkBtn { color: var(--amber-dark); border-color: var(--amber-dark); }
+.dangerBtn { color: var(--rust); border-color: var(--rust); }
+
+.emptyState { text-align: center; padding: 60px 20px; border: 2px dashed var(--line); border-radius: 8px; }
+.emptyState h3 { font-family: var(--display); font-size: 24px; text-transform: uppercase; margin: 0 0 6px; }
+.emptyState p { font-size: 13px; color: var(--ink-soft); margin: 0; }
+
+/* ---------- Detail page: clean, modern, spaced, no shelf motif ---------- */
+.detailPage {
+max-width: 560px;
+margin: 0 auto;
+padding: 4px 4px 40px;
+
+}
+.backLink {
+background: none;
+border: none;
+font-family: var(--sans);
+font-size: 13px;
+color: var(--ink-soft);
+cursor: pointer;
+padding: 0;
+margin-bottom: 32px;
+}
+.backLink:hover { color: var(--ink); }
+
+.detailHead { margin-bottom: 24px; }
+.detailCategory {
+font-family: var(--mono);
+font-size: 11px;
+text-transform: uppercase;
+letter-spacing: 0.6px;
+color: var(--ink-soft);
+}
+.detailName {
+font-family: var(--sans);
+font-weight: 600;
+font-size: 30px;
+line-height: 1.15;
+margin: 6px 0 14px;
+}
+.detailMetaRow { display: flex; align-items: center; justify-content: space-between; }
+.detailPrice { font-family: var(--mono); font-size: 14px; color: var(--ink); }
+.detailReview { font-size: 13px; font-style: italic; color: var(--ink-soft); margin: 12px 0 0; }
+.detailDesc { font-size: 15px; line-height: 1.55; color: var(--ink); margin: 0 0 32px; }
+
+.detailSection { margin-bottom: 32px; }
+.detailLabel {
+font-family: var(--mono);
+font-size: 11px;
+text-transform: uppercase;
+letter-spacing: 0.6px;
+color: var(--ink-soft);
+display: block;
+margin-bottom: 10px;
+}
+.sectionHeadRow { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.sectionHeadRow .detailLabel { margin-bottom: 0; }
+
+.qtyRow { display: flex; justify-content: space-between; align-items: center; }
+.stepBtn {
+width: 28px; height: 28px; border-radius: 50%;
+border: 1.5px solid var(--ink); background: #fff;
+font-size: 15px; line-height: 1; cursor: pointer;
+display: flex; align-items: center; justify-content: center;
+}
+.stepBtn:active { transform: scale(0.92); }
+.qty { font-size: 15px; min-width: 18px; text-align: center; }
+
+.factList { margin: 0; }
+.factRow {
+display: flex;
+justify-content: space-between;
+gap: 16px;
+padding: 10px 0;
+border-bottom: 1px solid var(--line);
+font-size: 14px;
+
+}
+.factRow:last-child { border-bottom: none; }
+.factRow dt { color: var(--ink-soft); margin: 0; }
+.factRow dd { margin: 0; text-align: right; font-weight: 500; }
+
+.mutedLine { font-size: 13px; color: var(--ink-soft); margin: 0; }
+.verifyLink { color: var(--amber-dark); text-decoration: none; border-bottom: 1px dashed var(--amber-dark); }
+.verifyLink:hover { color: var(--rust); border-color: var(--rust); }
+.installRow {
+display: flex;
+justify-content: space-between;
+align-items: center;
+gap: 10px;
+padding: 10px 0;
+border-bottom: 1px solid var(--line);
+flex-wrap: wrap;
+}
+.installLoc { font-size: 14px; font-weight: 500; }
+.installDate { font-size: 12px; color: var(--ink-soft); }
+.replaceBadge {
+font-family: var(--mono);
+font-size: 10px;
+text-transform: uppercase;
+letter-spacing: 0.3px;
+padding: 3px 8px;
+border-radius: 3px;
+white-space: nowrap;
+}
+.replaceBadge.ok { background: var(--sage-bg); color: var(--sage); }
+.replaceBadge.soon { background: #F5E7C4; color: var(--amber-dark); }
+.replaceBadge.overdue { background: var(--rust-bg); color: var(--rust); }
+.removeInstBtn {
+
+width: 22px; height: 22px; border-radius: 50%;
+border: 1px solid var(--line); background: none;
+color: var(--ink-soft); font-size: 13px; line-height: 1; cursor: pointer;
+}
+.locBtn {
+    font-family: var(--sans); font-size: 13px; background: none; border: none;
+    border-bottom: 1px dashed var(--ink-soft); color: var(--ink); cursor: pointer; padding: 0;
+  }
+  .locInput { font-family: var(--sans); font-size: 13px; border: 1px solid var(--ink); border-radius: 4px; padding: 8px 10px; }
+  .dateInput { font-family: var(--mono); font-size: 12px; border: 1px solid var(--ink); border-radius: 4px; padding: 7px 8px; flex: 1; }
+  .installForm { margin-top: 10px; padding: 12px; background: var(--paper-alt); border-radius: 6px; }
+
+  .chipRow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { font-size: 13px; background: var(--paper-alt); padding: 5px 12px; border-radius: 14px; border: 1px solid var(--line); }
+  .chipLink { color: var(--ink); text-decoration: none; cursor: pointer; }
+  .chipLink:hover { background: var(--amber); border-color: var(--amber-dark); }
+
+  .detailActions { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 40px; }
+
+  .detailFooter {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-top: 16px;
+    border-top: 1px dashed var(--line);
+  }
+  .skuText { font-size: 10px; color: var(--ink-soft); }
+`;
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<Stockroom />);
+</script>
+</body>
+</html>
