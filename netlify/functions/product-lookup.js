@@ -10,13 +10,16 @@
 // already knows how to read: { content: [{ type: "text", text: "..." }] }.
 //
 // Free-tier note: Gemini's free API keys don't always include access to the
-// Google Search grounding tool. This function tries WITH search grounding
-// first; if Gemini rejects that (common on a brand-new free key), it
-// automatically retries WITHOUT grounding so the app still returns a
-// best-effort answer instead of failing outright. Ungrounded answers rely on
-// the model's training data rather than a live search, so they'll be less
-// current and the app's own "needs a real source URL" checks will likely
-// blank out fields like rating/price that it can't back up.
+// Google Search grounding tool, and on some models the search tool itself is
+// unreliable (seen returning "MALFORMED_FUNCTION_CALL" with no text at all
+// on gemini-3.6-flash). This function tries WITH search grounding first; if
+// that fails outright OR comes back with no usable text, it automatically
+// retries WITHOUT grounding (explicitly telling the model not to attempt any
+// tool call) so the app still returns a best-effort answer instead of
+// failing outright. Ungrounded answers rely on the model's training data
+// rather than a live search, so they'll be less current and the app's own
+// "needs a real source URL" checks will likely blank out fields like
+// rating/price that it can't back up.
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
@@ -51,8 +54,19 @@ async function callGemini(apiKey, { system, contents, maxOutputTokens, withSearc
     ":generateContent?key=" +
     encodeURIComponent(apiKey);
 
+  // Without search we explicitly tell the model not to attempt any tool or
+  // function call. Some models (seen on gemini-3.6-flash) reflexively try to
+  // invoke a search-style function on their own even when no tool is
+  // declared, which the API rejects as a "MALFORMED_FUNCTION_CALL" and
+  // returns with no usable text — this instruction heads that off so the
+  // no-search fallback reliably produces an answer instead of another dead end.
+  const effectiveSystem = withSearch
+    ? system || ""
+    : (system || "") +
+      "\n\nDo not call any tools or functions. Answer directly using your own knowledge, without performing a search.";
+
   const body = {
-    systemInstruction: { parts: { text: system || "" } },
+    systemInstruction: { parts: { text: effectiveSystem } },
     contents,
     generationConfig: { maxOutputTokens: maxOutputTokens || 8192 },
   };
@@ -128,14 +142,6 @@ exports.handler = async function (event) {
       withSearch: false,
     });
     text = result.ok ? extractText(result.data) : "";
-  }
-
-  if (body.debug) {
-    return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(result.data),
-    };
   }
 
   if (!result.ok) {
