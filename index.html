@@ -366,12 +366,43 @@ function looksLikeRealUrl(u) {
 return typeof u === "string" && /^https?:\/\/\S+$/i.test(u.trim());
 }
 
+// Every purchase/rating/price link in this app points at a retailer's own
+// search results for the product name, rather than one specific page the AI
+// claims to have found. That's a deliberate choice, not a shortcut: a
+// well-formed, even a genuinely LIVE (HTTP 200) product URL from the model
+// can still be the WRONG product — retailers like Home Depot resolve their
+// /p/.../<id> pages purely by a numeric id and silently ignore a mismatched
+// slug, so a guessed id can open a real page for a completely different
+// item with no error at all. No amount of "does this link open" checking
+// catches that, so instead of trusting any model-provided URL for
+// navigation, this always builds a fresh, guaranteed-real search link from
+// the retailer name + product name. It's one click further from checkout
+// than a direct product link would be, but it can never be dead or wrong.
+function storeSearchUrl(store, query) {
+const q = encodeURIComponent(String(query || "").trim());
+if (!q) return null;
+const s = String(store || "").toLowerCase();
+if (s.includes("home depot")) return "https://www.homedepot.com/s/" + q;
+if (s.includes("lowe")) return "https://www.lowes.com/search?searchTerm=" + q;
+if (s.includes("target")) return "https://www.target.com/s?searchTerm=" + q;
+if (s.includes("walmart")) return "https://www.walmart.com/search?q=" + q;
+if (s.includes("best buy") || s.includes("bestbuy")) return "https://www.bestbuy.com/site/searchpage.jsp?st=" + q;
+if (s.includes("costco")) return "https://www.costco.com/CatalogSearch?keyword=" + q;
+if (s.includes("wayfair")) return "https://www.wayfair.com/keyword.php?keyword=" + q;
+if (s.includes("ace hardware")) return "https://www.acehardware.com/search?query=" + q;
+// Amazon, or any unrecognized/unnamed store: default to Amazon search,
+// since Amazon is the retailer this app is built to monetize through.
+return "https://www.amazon.com/s?k=" + q;
+}
+
 // Guards against hallucinated or malformed ratings: only accept a numeric
 // value (or numeric string, see toNumber) in the valid 1-5 range, backed by
-// BOTH a named source and a literal, checkable URL for the specific page it
-// came from. A site name with no real URL behind it is exactly the pattern
-// that let mismatched/incorrect ratings through before, so it's treated the
-// same as no rating at all.
+// a named source. The rating still displays the AI's own estimate — Gemini's
+// free tier has no way to fetch and confirm the live number on a specific
+// page — but the source name now links to a real, always-resolving search
+// for the product rather than a specific page the AI merely claims backs
+// the number (see storeSearchUrl above for why a specific link can't be
+// trusted even when it looks valid).
 //
 // The review count gets the same treatment, as its own field: previously the
 // count only ever showed up folded into the free-text rating_source string
@@ -379,12 +410,12 @@ return typeof u === "string" && /^https?:\/\/\S+$/i.test(u.trim());
 // was never checked against anything — so a wrong or made-up number could
 // slip straight through unnoticed. rating_count is now a separate value that
 // only survives sanitization when it's a real non-negative number, and it's
-// only trusted at all alongside the same verified rating + source URL the
-// star rating requires.
-function sanitizeRating(info, listingUrl) {
+// only trusted at all alongside the same verified rating + source the star
+// rating requires.
+function sanitizeRating(info, query) {
 const r = toNumber(info.rating);
-if (r == null || r < 1 || r > 5 || !listingUrl) {
-
+const source = info.rating_source || info.store || info.price_source || null;
+if (r == null || r < 1 || r > 5 || !source) {
 return { rating: null, ratingCount: null, ratingSource: null, ratingSourceUrl: null };
 }
 const countRaw = toNumber(info.rating_count);
@@ -392,35 +423,35 @@ const ratingCount = countRaw != null && countRaw >= 0 ? Math.round(countRaw) : n
 return {
 rating: Math.round(r * 10) / 10,
 ratingCount,
-ratingSource: info.price_source || info.store || null,
-ratingSourceUrl: listingUrl
+ratingSource: source,
+ratingSourceUrl: storeSearchUrl(source, query)
 };
 }
 
-// Same idea as sanitizeRating: a price with no real, specific listing URL
-// behind it is treated as unknown rather than shown, so nothing on screen
-// is a guess dressed up with a plausible retailer name. price and rating
-// are both pinned to the SAME listingUrl the customer gets sent to buy
-// from, rather than trusting the model to repeat a matching URL per field.
-function sanitizePrice(info, listingUrl) {
+// Same idea as sanitizeRating: a price with no named source is treated as
+// unknown rather than shown. price and rating both link to the SAME
+// search results the customer would use to buy from, rather than a
+// specific guessed page.
+function sanitizePrice(info, query) {
 const v = toNumber(info.price_value);
-const src = info.price_source;
-if (v == null || v < 0 || !src || !listingUrl) {
+const src = info.price_source || info.store || null;
+if (v == null || v < 0 || !src) {
 return { priceValue: null, priceSource: null, priceSourceUrl: null, priceEstimate: null };
 }
-return { priceValue: v, priceSource: src, priceSourceUrl: listingUrl, priceEstimate: info.price_estimate || null };
+return { priceValue: v, priceSource: src, priceSourceUrl: storeSearchUrl(src, query), priceEstimate: info.price_estimate || null };
 }
 
-// Same no-URL-no-trust rule as price/rating, applied per alternative: keep
-// the name and reason either way (still useful on their own) but only keep
-// a clickable url when it's a real, well-formed link — never a guessed one.
+// Same spirit as sanitizeRating/sanitizePrice: keep the name and reason
+// either way (still useful on their own), but the clickable link is always
+// a real search for that alternative's name rather than a URL the model
+// guessed — no store is given per-alternative, so this defaults to Amazon.
 function sanitizeAlternatives(alts) {
 if (!Array.isArray(alts)) return [];
 return alts.slice(0, 3).map((alt) => ({
 
 name: alt && alt.name ? String(alt.name) : "",
 reason: alt && alt.reason ? String(alt.reason) : "",
-url: alt && looksLikeRealUrl(alt.url) ? alt.url.trim() : null
+url: alt && alt.name ? storeSearchUrl(null, alt.name) : null
 })).filter((alt) => alt.name);
 }
 
@@ -840,9 +871,10 @@ console.error("Storage error", e);
 const runLookup = async (id, query) => {
 try {
 const info = await callClaude(query);
-const listingUrl = looksLikeRealUrl(info.listing_url) ? info.listing_url.trim() : null;
-const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, listingUrl);
-const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, listingUrl);
+const searchQuery = info.name || query;
+const purchaseLink = storeSearchUrl(info.store || info.price_source, searchQuery);
+const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, searchQuery);
+const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, searchQuery);
 setItems((prev) => {
 const next = prev.map((it) => {
 
@@ -860,7 +892,7 @@ priceValue,
 priceSource,
 priceSourceUrl,
 warranty: info.warranty || null,
-purchaseLink: listingUrl,
+purchaseLink,
 rating,
 ratingCount,
 ratingSource,
@@ -892,9 +924,10 @@ return next;
 const runImageLookup = async (id, base64Data, mediaType) => {
 try {
 const info = await callClaudeWithImage(base64Data, mediaType);
-const listingUrl = looksLikeRealUrl(info.listing_url) ? info.listing_url.trim() : null;
-const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, listingUrl);
-const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, listingUrl);
+const searchQuery = info.name || "this item";
+const purchaseLink = storeSearchUrl(info.store || info.price_source, searchQuery);
+const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, searchQuery);
+const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, searchQuery);
 setItems((prev) => {
 const next = prev.map((it) => {
 if (it.id !== id) return it;
@@ -912,7 +945,7 @@ priceSource,
 priceSourceUrl,
 warranty: info.warranty || null,
 
-purchaseLink: listingUrl,
+purchaseLink,
 rating,
 ratingCount,
 ratingSource,
