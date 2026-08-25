@@ -225,6 +225,17 @@ exports.handler = async function (event) {
     withSearch: true,
   });
 
+  // Temporary debug hook (remove once grounding investigation is done): lets
+  // us inspect the raw Gemini response, including groundingMetadata, without
+  // affecting normal app traffic.
+  if (body.__debug === "grounding") {
+    return {
+      statusCode: 200,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(result.data, null, 2),
+    };
+  }
+
   let text = result.ok ? extractText(result.data) : "";
 
   // Retry once without search grounding if the first attempt either failed
