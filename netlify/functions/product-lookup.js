@@ -21,20 +21,34 @@
 // "needs a real source URL" checks will likely blank out fields like
 // rating/price that it can't back up.
 //
-// Link-liveness check: neither the search-grounded nor the ungrounded model
-// call actually confirms the product URL it names is still a real, working
-// page — an LLM can produce a perfectly well-formed
+// Trustworthy product links: an LLM can produce a perfectly well-formed
 // https://www.amazon.com/.../dp/XXXXXXXXXX link for a listing that's been
-// removed or never existed, and the app's own frontend checks (see
-// looksLikeRealUrl in index.html) only check the URL's shape, not whether it
-// resolves. Since this function runs on Netlify's servers, it CAN make its
-// own outbound request to check — so after Gemini responds, this function
-// fetches the claimed listing_url (and each alternative's url) itself and
-// strips out any that come back 404/410 (confirmed dead) before handing the
-// result to the app. A blocked/ambiguous response (403/405/429, or a
-// timeout) is left alone rather than stripped, since that usually means
-// anti-bot defenses rather than a genuinely dead page, and we'd rather risk
-// keeping a real link than wrongly deleting one.
+// removed or never existed (dead), or — worse — a link that's genuinely
+// LIVE but resolves to a completely different product (seen on Home Depot,
+// whose /p/.../<id> pages resolve purely by the numeric id and silently
+// ignore a mismatched slug). Neither failure shows up in the URL's shape
+// alone, which is all the app's own frontend check (looksLikeRealUrl in
+// index.html) can see.
+//
+// The fix uses what Gemini's Google Search grounding tool actually gives us:
+// when grounding succeeds, the response includes groundingMetadata citing
+// the real pages Google's search found for this query (groundingChunks[].web
+// .uri/.title) — these aren't the model's own account of what it read, they're
+// Google's. This function follows each citation's redirect to see where it
+// really lands, then tries to match one to the product's named store (by
+// domain) or to each alternative's name (by matching the citation's title).
+// A match found this way REPLACES whatever URL the model wrote for that
+// field, since a grounded, independently-resolved citation is strictly more
+// trustworthy than model-generated text.
+//
+// When no grounded match is found for a field (grounding wasn't available,
+// or nothing in the citations matched), this falls back to fetching the
+// model's own claimed URL directly and only stripping it (setting it to
+// null) if that comes back a confirmed 404/410. A blocked/ambiguous response
+// (403/405/429, or a timeout) is left alone rather than stripped, since that
+// usually means anti-bot defenses rather than a genuinely dead page. If a
+// field ends up null after all of this, the app's frontend falls back to a
+// guaranteed-real retailer search link rather than showing nothing.
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
@@ -149,35 +163,163 @@ async function checkUrlLiveness(url) {
   }
 }
 
-// Checks listing_url and every alternatives[].url in parallel and blanks out
-// (sets to null) any confirmed-dead one. Never throws — any unexpected
-// failure here just leaves the data as Gemini returned it, so a bug in this
-// safety net can't take down product lookups entirely.
-async function stripDeadLinks(obj) {
-  try {
-    const checks = [];
+// Pulls the real search citations out of a grounded Gemini response. Each
+// citation's uri is always an opaque https://vertexaisearch.cloud.google.com
+// redirect link (Google never exposes the raw destination up front) — never
+// the real page itself — so these are only useful once resolved (see
+// resolveGroundingCitations below). Returns [] whenever grounding wasn't
+// used or the API didn't include any (e.g. this key/model combo has no
+// grounding access, or nothing was found).
+function extractGroundingCitations(data) {
+  const candidate = data.candidates && data.candidates[0];
+  const meta = candidate && candidate.groundingMetadata;
+  const chunks = (meta && meta.groundingChunks) || [];
+  return chunks
+    .map((c) => c && c.web)
+    .filter((w) => w && typeof w.uri === "string" && w.uri.trim())
+    .map((w) => ({ uri: w.uri.trim(), title: (w.title || "").trim() }));
+}
 
-    if (obj.listing_url && typeof obj.listing_url === "string") {
-      checks.push(
-        checkUrlLiveness(obj.listing_url.trim()).then((status) => {
-          if (status === "dead") obj.listing_url = null;
-        })
-      );
+// Follows each citation's redirect (in parallel, with a short per-citation
+// timeout so one slow/dead citation can't stall the whole lookup) and
+// records where it actually lands. A citation that fails to resolve is
+// simply dropped — it's never treated as evidence either way.
+async function resolveGroundingCitations(citations) {
+  const resolved = [];
+  await Promise.allSettled(
+    citations.map(async (citation) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      try {
+        const res = await fetch(citation.uri, {
+          method: "GET",
+          redirect: "follow",
+          signal: controller.signal,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          },
+        });
+        if (res.ok && res.url) {
+          resolved.push({ url: res.url, title: citation.title });
+        }
+      } catch (e) {
+        // unreachable or timed out — not usable as a trusted link
+      } finally {
+        clearTimeout(timeout);
+      }
+    })
+  );
+  return resolved;
+}
+
+function hostnameOf(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "").toLowerCase();
+  } catch (e) {
+    return "";
+  }
+}
+
+// Small store-name -> domain map so a resolved citation's hostname can be
+// matched back to the store name Gemini named (e.g. "Home Depot" ->
+// homedepot.com).
+const STORE_DOMAINS = {
+  amazon: "amazon.com",
+  "home depot": "homedepot.com",
+  homedepot: "homedepot.com",
+  lowe: "lowes.com",
+  target: "target.com",
+  walmart: "walmart.com",
+  "best buy": "bestbuy.com",
+  bestbuy: "bestbuy.com",
+  costco: "costco.com",
+  wayfair: "wayfair.com",
+  "ace hardware": "acehardware.com",
+};
+
+function domainForStore(storeName) {
+  const s = String(storeName || "").toLowerCase();
+  for (const key in STORE_DOMAINS) {
+    if (s.includes(key)) return STORE_DOMAINS[key];
+  }
+  return null;
+}
+
+// Finds the best grounded (Google-verified) page for the named store among
+// already-resolved citations, preferring one whose path looks like an actual
+// product-detail page (e.g. "/dp/", "/p/") over a bare category or search
+// page, since that's the one useful as a direct "buy this" link.
+function bestGroundedMatchForStore(resolved, storeName) {
+  const wantDomain = domainForStore(storeName);
+  if (!wantDomain) return null;
+  const matches = resolved.filter((r) => {
+    const h = hostnameOf(r.url);
+    return h === wantDomain || h.endsWith("." + wantDomain);
+  });
+  if (!matches.length) return null;
+  const productLike = matches.find((r) => /\/(dp|p|product|ip|pd)\//i.test(r.url));
+  return (productLike || matches[0]).url;
+}
+
+// Alternatives don't come with a store name to match on, so instead this
+// matches a citation's title against the alternative's own product name — if
+// Google's search actually surfaced a page whose title contains most of the
+// significant words in that name, that's good evidence it's a real, findable
+// listing for that exact product (not a coincidental one-word match).
+function bestGroundedMatchForName(resolved, name) {
+  if (!name) return null;
+  const words = String(name)
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+  if (!words.length) return null;
+  let best = null;
+  let bestScore = 0;
+  resolved.forEach((r) => {
+    const title = r.title.toLowerCase();
+    if (!title) return;
+    const score = words.filter((w) => title.includes(w)).length;
+    if (score > bestScore) {
+      bestScore = score;
+      best = r.url;
+    }
+  });
+  return bestScore >= Math.ceil(words.length / 2) ? best : null;
+}
+
+// Reconciles listing_url and every alternatives[].url against the grounded
+// citations first, falling back to a plain liveness check (blanking out only
+// confirmed-dead links) when no grounded match is found for a field. Never
+// throws — any unexpected failure here just leaves the data as Gemini
+// returned it, so a bug in this safety net can't take down product lookups
+// entirely.
+async function reconcileLinks(obj, resolvedCitations) {
+  try {
+    if (obj.listing_url || obj.listing_url === undefined) {
+      const grounded = bestGroundedMatchForStore(resolvedCitations, obj.store || obj.price_source);
+      if (grounded) {
+        obj.listing_url = grounded;
+      } else if (obj.listing_url && typeof obj.listing_url === "string") {
+        const status = await checkUrlLiveness(obj.listing_url.trim());
+        if (status === "dead") obj.listing_url = null;
+      }
     }
 
     if (Array.isArray(obj.alternatives)) {
-      obj.alternatives.forEach((alt) => {
-        if (alt && typeof alt.url === "string" && alt.url.trim()) {
-          checks.push(
-            checkUrlLiveness(alt.url.trim()).then((status) => {
-              if (status === "dead") alt.url = null;
-            })
-          );
-        }
-      });
+      await Promise.allSettled(
+        obj.alternatives.map(async (alt) => {
+          if (!alt) return;
+          const grounded = bestGroundedMatchForName(resolvedCitations, alt.name);
+          if (grounded) {
+            alt.url = grounded;
+          } else if (typeof alt.url === "string" && alt.url.trim()) {
+            const status = await checkUrlLiveness(alt.url.trim());
+            if (status === "dead") alt.url = null;
+          }
+        })
+      );
     }
-
-    await Promise.allSettled(checks);
   } catch (e) {
     // swallow — see comment above
   }
@@ -236,6 +378,11 @@ exports.handler = async function (event) {
     };
   }
 
+  // Grab the real search citations now, before the possible ungrounded
+  // retry below overwrites `result` — only the search-grounded call ever
+  // has any.
+  const groundingCitations = result.ok ? extractGroundingCitations(result.data) : [];
+
   let text = result.ok ? extractText(result.data) : "";
 
   // Retry once without search grounding if the first attempt either failed
@@ -278,14 +425,18 @@ exports.handler = async function (event) {
   }
 
   // Best-effort link verification. If we can cleanly parse the JSON Gemini
-  // produced, check the URLs it named and drop any that are confirmed dead,
-  // then hand back the patched JSON instead of the raw text. If parsing
-  // fails for any reason, fall through and return Gemini's text untouched —
-  // the frontend has its own (shape-only) URL checks as a last line of
-  // defense either way.
+  // produced, replace/check the URLs it named against real search citations
+  // (falling back to a plain liveness check where no citation matches), then
+  // hand back the patched JSON instead of the raw text. If parsing fails for
+  // any reason, fall through and return Gemini's text untouched — the
+  // frontend has its own (shape-only) URL checks as a last line of defense
+  // either way.
   const parsed = extractJsonObject(text);
   if (parsed) {
-    await stripDeadLinks(parsed);
+    const resolvedCitations = groundingCitations.length
+      ? await resolveGroundingCitations(groundingCitations)
+      : [];
+    await reconcileLinks(parsed, resolvedCitations);
     text = JSON.stringify(parsed);
   }
 
