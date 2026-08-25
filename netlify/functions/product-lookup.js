@@ -37,24 +37,33 @@
 // Google's. This function follows each citation's redirect to see where it
 // really lands, then tries to match one to the product's named store (by
 // domain) or to each alternative's name (by matching the citation's title).
-// A match found this way REPLACES whatever URL the model wrote for that
-// field, since a grounded, independently-resolved citation is strictly more
-// trustworthy than model-generated text.
+// A match found this way is preferred over whatever URL the model wrote for
+// that field, since an independently-resolved citation is generally more
+// trustworthy than model-generated text — but it is NOT trusted blindly: see
+// checkUrlAgainstProduct below. A citation being reachable when Google's
+// index was built (or even a moment ago, when this function resolved its
+// redirect) doesn't mean the page still shows the right product now —
+// listings get delisted, ids get reused, and some stores (Amazon included)
+// serve a soft "page not found" screen with an HTTP 200 rather than a real
+// 404. So every grounded match is run back through checkUrlAgainstProduct
+// just like a model-claimed URL would be, before it's trusted.
 //
-// When no grounded match is found for a field (grounding wasn't available —
-// e.g. this key hit its free-tier grounding quota and fell back to an
-// ungrounded answer — or nothing in the citations matched), this falls back
-// to fetching the model's own claimed URL directly via checkUrlAgainstProduct,
-// which goes a step further than a plain liveness check: it also reads the
-// fetched page's own <title> and compares it against the product's name, so
-// a live-but-wrong page (the Home Depot case above) gets caught even though
-// it never 404s. The link is only stripped (set to null) on a confirmed dead
-// page or a clear title mismatch — a blocked/ambiguous response (403/405/429,
-// a timeout, or a page whose title looks like an anti-bot challenge) is left
-// alone, since that usually means bot defenses rather than a genuinely wrong
-// page, and we'd rather risk keeping a real link than wrongly deleting one.
-// If a field ends up null after all of this, the app's frontend falls back
-// to a guaranteed-real retailer search link rather than showing nothing.
+// This falls back to fetching the model's own claimed URL directly via
+// checkUrlAgainstProduct when no grounded match is found for a field
+// (grounding wasn't available — e.g. this key hit its free-tier grounding
+// quota and fell back to an ungrounded answer — or nothing in the citations
+// matched) OR when the grounded match itself fails that same check.
+// checkUrlAgainstProduct goes a step further than a plain liveness check: it
+// also reads the fetched page's own <title> and compares it against the
+// product's name, so a live-but-wrong page (the Home Depot case above) gets
+// caught even though it never 404s. The link is only stripped (set to null)
+// on a confirmed dead page or a clear title mismatch — a blocked/ambiguous
+// response (403/405/429, a timeout, or a page whose title looks like an
+// anti-bot challenge) is left alone, since that usually means bot defenses
+// rather than a genuinely wrong page, and we'd rather risk keeping a real
+// link than wrongly deleting one. If a field ends up null after all of this,
+// the app's frontend falls back to a guaranteed-real retailer search link
+// rather than showing nothing.
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
@@ -353,24 +362,41 @@ function bestGroundedMatchForName(resolved, name) {
 }
 
 // Reconciles listing_url and every alternatives[].url against the grounded
-// citations first — a match there is trusted outright, since it's an
-// independently-resolved page Google's own search actually surfaced.
-// Failing that, this falls back to checkUrlAgainstProduct, which drops the
-// link on either a confirmed-dead page OR a live page whose own title
-// doesn't match the product (the Home Depot wrong-id failure mode) —
-// stricter than a plain liveness check, but still fails open (keeps the
-// link) on anything ambiguous like a bot-block page. Never throws — any
-// unexpected failure here just leaves the data as Gemini returned it, so a
-// bug in this safety net can't take down product lookups entirely.
+// citations first — a match there is a strong signal, since it's an
+// independently-resolved page Google's own search actually surfaced — but
+// it still gets run through checkUrlAgainstProduct before being trusted,
+// because a citation resolving with an HTTP-ok status when Google indexed it
+// (or even moments ago, during resolveGroundingCitations above) doesn't
+// guarantee the page still shows that product now. If the grounded match
+// fails that check (dead or mismatched title), this falls back to checking
+// whatever URL the model itself claimed, exactly as it would if no grounded
+// match had been found at all. checkUrlAgainstProduct drops the link on
+// either a confirmed-dead page OR a live page whose own title doesn't match
+// the product (the Home Depot wrong-id failure mode, or the Amazon
+// soft-404-with-200 failure mode) — stricter than a plain liveness check,
+// but still fails open (keeps the link) on anything ambiguous like a
+// bot-block page. Never throws — any unexpected failure here just leaves the
+// data as Gemini returned it, so a bug in this safety net can't take down
+// product lookups entirely.
 async function reconcileLinks(obj, resolvedCitations) {
   try {
     if (obj.listing_url || obj.listing_url === undefined) {
       const grounded = bestGroundedMatchForStore(resolvedCitations, obj.store || obj.price_source);
+      let groundedOk = false;
       if (grounded) {
+        const groundedStatus = await checkUrlAgainstProduct(grounded, obj.name);
+        groundedOk = groundedStatus !== "dead" && groundedStatus !== "mismatch";
+      }
+      if (groundedOk) {
         obj.listing_url = grounded;
       } else if (obj.listing_url && typeof obj.listing_url === "string") {
         const status = await checkUrlAgainstProduct(obj.listing_url.trim(), obj.name);
         if (status === "dead" || status === "mismatch") obj.listing_url = null;
+      } else if (grounded) {
+        // Had a grounded candidate and nothing else to fall back on, but the
+        // candidate itself didn't hold up — don't hand back a link we just
+        // proved is wrong.
+        obj.listing_url = null;
       }
     }
 
@@ -379,11 +405,18 @@ async function reconcileLinks(obj, resolvedCitations) {
         obj.alternatives.map(async (alt) => {
           if (!alt) return;
           const grounded = bestGroundedMatchForName(resolvedCitations, alt.name);
+          let groundedOk = false;
           if (grounded) {
+            const groundedStatus = await checkUrlAgainstProduct(grounded, alt.name);
+            groundedOk = groundedStatus !== "dead" && groundedStatus !== "mismatch";
+          }
+          if (groundedOk) {
             alt.url = grounded;
           } else if (typeof alt.url === "string" && alt.url.trim()) {
             const status = await checkUrlAgainstProduct(alt.url.trim(), alt.name);
             if (status === "dead" || status === "mismatch") alt.url = null;
+          } else if (grounded) {
+            alt.url = null;
           }
         })
       );
@@ -434,17 +467,6 @@ exports.handler = async function (event) {
     maxOutputTokens: body.max_tokens,
     withSearch: true,
   });
-
-  // Temporary debug hook (remove once grounding investigation is done): lets
-  // us inspect the raw Gemini response, including groundingMetadata, without
-  // affecting normal app traffic.
-  if (body.__debug === "grounding") {
-    return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(result.data, null, 2),
-    };
-  }
 
   // Grab the real search citations now, before the possible ungrounded
   // retry below overwrites `result` — only the search-grounded call ever
