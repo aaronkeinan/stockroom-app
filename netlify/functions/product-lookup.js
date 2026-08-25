@@ -41,14 +41,20 @@
 // field, since a grounded, independently-resolved citation is strictly more
 // trustworthy than model-generated text.
 //
-// When no grounded match is found for a field (grounding wasn't available,
-// or nothing in the citations matched), this falls back to fetching the
-// model's own claimed URL directly and only stripping it (setting it to
-// null) if that comes back a confirmed 404/410. A blocked/ambiguous response
-// (403/405/429, or a timeout) is left alone rather than stripped, since that
-// usually means anti-bot defenses rather than a genuinely dead page. If a
-// field ends up null after all of this, the app's frontend falls back to a
-// guaranteed-real retailer search link rather than showing nothing.
+// When no grounded match is found for a field (grounding wasn't available —
+// e.g. this key hit its free-tier grounding quota and fell back to an
+// ungrounded answer — or nothing in the citations matched), this falls back
+// to fetching the model's own claimed URL directly via checkUrlAgainstProduct,
+// which goes a step further than a plain liveness check: it also reads the
+// fetched page's own <title> and compares it against the product's name, so
+// a live-but-wrong page (the Home Depot case above) gets caught even though
+// it never 404s. The link is only stripped (set to null) on a confirmed dead
+// page or a clear title mismatch — a blocked/ambiguous response (403/405/429,
+// a timeout, or a page whose title looks like an anti-bot challenge) is left
+// alone, since that usually means bot defenses rather than a genuinely wrong
+// page, and we'd rather risk keeping a real link than wrongly deleting one.
+// If a field ends up null after all of this, the app's frontend falls back
+// to a guaranteed-real retailer search link rather than showing nothing.
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
@@ -129,33 +135,91 @@ function extractJsonObject(text) {
   }
 }
 
-// Returns "dead", "alive", or "unknown" for a given URL. Only "dead" causes
-// the caller to strip the link — "unknown" (timeout, network error, or an
-// ambiguous status like 403/405/429 that usually means bot-blocking rather
-// than a missing page) leaves the link untouched.
-async function checkUrlLiveness(url) {
+// Phrases that show up on bot-block / CAPTCHA / access-denied interstitials
+// rather than a real product page. When a fetched title matches one of these
+// we treat the result as inconclusive rather than as evidence the product
+// doesn't match — anti-bot pages are common and shouldn't cost a real link.
+const BOT_BLOCK_SIGNALS = [
+  "are you a human",
+  "access denied",
+  "captcha",
+  "robot check",
+  "unusual traffic",
+  "verify you are a human",
+  "just a moment",
+  "attention required",
+];
+
+// Checks a claimed product URL two ways: is it even live, and — when we can
+// tell — does the page it actually resolves to look like the right product.
+// This second check exists because of a real failure mode: some retailers
+// (Home Depot's /p/.../<id> pages are the confirmed case) resolve purely by
+// a numeric id and silently ignore a mismatched slug, so a guessed id can
+// return a genuinely live 200 for a completely different item — no 404, no
+// error, just the wrong page. A liveness check alone can't catch that; only
+// looking at what the page actually says it is can.
+//
+// Returns:
+//   "dead"     — confirmed 404/410, caller should drop the link
+//   "mismatch" — page loaded fine but its title shares none of the
+//                product's significant words, caller should drop the link
+//   "ok"       — either the title matches, or GET didn't return anything
+//                specific enough to compare
+//   "unknown"  — timeout, network error, or a blocked/ambiguous status
+//                (403/405/429) — usually anti-bot defenses, not a dead or
+//                wrong page, so the caller should leave the link untouched
+async function checkUrlAgainstProduct(url, productName) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3500);
-  const fetchOpts = (method) => ({
-    method,
-    redirect: "follow",
-    signal: controller.signal,
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    },
-  });
+  const timeout = setTimeout(() => controller.abort(), 4500);
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+  };
   try {
     let res;
     try {
-      res = await fetch(url, fetchOpts("HEAD"));
-    } catch (headErr) {
-      // Some sites reject HEAD outright (not the same as the page being
-      // gone) — retry once with GET before giving up on this URL.
-      res = await fetch(url, fetchOpts("GET"));
+      res = await fetch(url, { method: "GET", redirect: "follow", signal: controller.signal, headers });
+    } catch (getErr) {
+      return "unknown";
     }
     if (res.status === 404 || res.status === 410) return "dead";
-    return "alive";
+    if (!res.ok) return "unknown";
+
+    const words = String(productName || "")
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 2);
+    if (!words.length) return "ok";
+
+    // Only read enough of the body to find <title> — these pages can be
+    // large, and we don't need the rest.
+    let html = "";
+    try {
+      const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+      if (reader) {
+        const decoder = new TextDecoder();
+        while (html.length < 20000) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          html += decoder.decode(value, { stream: true });
+        }
+        reader.cancel().catch(() => {});
+      } else {
+        html = (await res.text()).slice(0, 20000);
+      }
+    } catch (readErr) {
+      return "ok"; // couldn't read the body — don't penalize the link for that
+    }
+
+    const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+    if (!titleMatch) return "ok";
+    const title = titleMatch[1].toLowerCase();
+    if (!title.trim()) return "ok";
+    if (BOT_BLOCK_SIGNALS.some((signal) => title.includes(signal))) return "ok";
+
+    const score = words.filter((w) => title.includes(w)).length;
+    if (score >= Math.ceil(words.length / 2)) return "ok";
+    return "mismatch";
   } catch (e) {
     return "unknown";
   } finally {
@@ -289,11 +353,15 @@ function bestGroundedMatchForName(resolved, name) {
 }
 
 // Reconciles listing_url and every alternatives[].url against the grounded
-// citations first, falling back to a plain liveness check (blanking out only
-// confirmed-dead links) when no grounded match is found for a field. Never
-// throws — any unexpected failure here just leaves the data as Gemini
-// returned it, so a bug in this safety net can't take down product lookups
-// entirely.
+// citations first — a match there is trusted outright, since it's an
+// independently-resolved page Google's own search actually surfaced.
+// Failing that, this falls back to checkUrlAgainstProduct, which drops the
+// link on either a confirmed-dead page OR a live page whose own title
+// doesn't match the product (the Home Depot wrong-id failure mode) —
+// stricter than a plain liveness check, but still fails open (keeps the
+// link) on anything ambiguous like a bot-block page. Never throws — any
+// unexpected failure here just leaves the data as Gemini returned it, so a
+// bug in this safety net can't take down product lookups entirely.
 async function reconcileLinks(obj, resolvedCitations) {
   try {
     if (obj.listing_url || obj.listing_url === undefined) {
@@ -301,8 +369,8 @@ async function reconcileLinks(obj, resolvedCitations) {
       if (grounded) {
         obj.listing_url = grounded;
       } else if (obj.listing_url && typeof obj.listing_url === "string") {
-        const status = await checkUrlLiveness(obj.listing_url.trim());
-        if (status === "dead") obj.listing_url = null;
+        const status = await checkUrlAgainstProduct(obj.listing_url.trim(), obj.name);
+        if (status === "dead" || status === "mismatch") obj.listing_url = null;
       }
     }
 
@@ -314,8 +382,8 @@ async function reconcileLinks(obj, resolvedCitations) {
           if (grounded) {
             alt.url = grounded;
           } else if (typeof alt.url === "string" && alt.url.trim()) {
-            const status = await checkUrlLiveness(alt.url.trim());
-            if (status === "dead") alt.url = null;
+            const status = await checkUrlAgainstProduct(alt.url.trim(), alt.name);
+            if (status === "dead" || status === "mismatch") alt.url = null;
           }
         })
       );
