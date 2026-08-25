@@ -366,18 +366,18 @@ function looksLikeRealUrl(u) {
 return typeof u === "string" && /^https?:\/\/\S+$/i.test(u.trim());
 }
 
-// Every purchase/rating/price link in this app points at a retailer's own
-// search results for the product name, rather than one specific page the AI
-// claims to have found. That's a deliberate choice, not a shortcut: a
-// well-formed, even a genuinely LIVE (HTTP 200) product URL from the model
-// can still be the WRONG product — retailers like Home Depot resolve their
-// /p/.../<id> pages purely by a numeric id and silently ignore a mismatched
-// slug, so a guessed id can open a real page for a completely different
-// item with no error at all. No amount of "does this link open" checking
-// catches that, so instead of trusting any model-provided URL for
-// navigation, this always builds a fresh, guaranteed-real search link from
-// the retailer name + product name. It's one click further from checkout
-// than a direct product link would be, but it can never be dead or wrong.
+// Last-resort link: a retailer's own search results for the product name,
+// used only when we don't have a specific product page we actually trust.
+// A well-formed, even genuinely LIVE (HTTP 200) product URL can still be the
+// WRONG product — retailers like Home Depot resolve their /p/.../<id> pages
+// purely by a numeric id and silently ignore a mismatched slug, so a guessed
+// id can open a real page for a completely different item with no error at
+// all. The server-side lookup (see netlify/functions/product-lookup.js)
+// cross-checks the model's claimed link against Google's own search results
+// before handing it back, so most of the time the app now gets a genuine,
+// specific product page — this search link only kicks in as a fallback when
+// that couldn't be confirmed, so the customer always has something to click
+// even when a specific page can't be guaranteed.
 function storeSearchUrl(store, query) {
 const q = encodeURIComponent(String(query || "").trim());
 if (!q) return null;
@@ -399,10 +399,10 @@ return "https://www.amazon.com/s?k=" + q;
 // value (or numeric string, see toNumber) in the valid 1-5 range, backed by
 // a named source. The rating still displays the AI's own estimate — Gemini's
 // free tier has no way to fetch and confirm the live number on a specific
-// page — but the source name now links to a real, always-resolving search
-// for the product rather than a specific page the AI merely claims backs
-// the number (see storeSearchUrl above for why a specific link can't be
-// trusted even when it looks valid).
+// page — but the source name links to the same verified product page
+// (verifiedUrl, see runLookup/runImageLookup) the rest of the item links to,
+// falling back to a guaranteed-real search for the product only when no
+// specific page could be confirmed (see storeSearchUrl above).
 //
 // The review count gets the same treatment, as its own field: previously the
 // count only ever showed up folded into the free-text rating_source string
@@ -412,7 +412,7 @@ return "https://www.amazon.com/s?k=" + q;
 // only survives sanitization when it's a real non-negative number, and it's
 // only trusted at all alongside the same verified rating + source the star
 // rating requires.
-function sanitizeRating(info, query) {
+function sanitizeRating(info, query, verifiedUrl) {
 const r = toNumber(info.rating);
 const source = info.rating_source || info.store || info.price_source || null;
 if (r == null || r < 1 || r > 5 || !source) {
@@ -424,35 +424,41 @@ return {
 rating: Math.round(r * 10) / 10,
 ratingCount,
 ratingSource: source,
-ratingSourceUrl: storeSearchUrl(source, query)
+ratingSourceUrl: verifiedUrl || storeSearchUrl(source, query)
 };
 }
 
 // Same idea as sanitizeRating: a price with no named source is treated as
-// unknown rather than shown. price and rating both link to the SAME
-// search results the customer would use to buy from, rather than a
-// specific guessed page.
-function sanitizePrice(info, query) {
+// unknown rather than shown. price and rating both link to the same
+// verified product page the customer would use to buy from, falling back to
+// a search only when no specific page could be confirmed.
+function sanitizePrice(info, query, verifiedUrl) {
 const v = toNumber(info.price_value);
 const src = info.price_source || info.store || null;
 if (v == null || v < 0 || !src) {
 return { priceValue: null, priceSource: null, priceSourceUrl: null, priceEstimate: null };
 }
-return { priceValue: v, priceSource: src, priceSourceUrl: storeSearchUrl(src, query), priceEstimate: info.price_estimate || null };
+return { priceValue: v, priceSource: src, priceSourceUrl: verifiedUrl || storeSearchUrl(src, query), priceEstimate: info.price_estimate || null };
 }
 
 // Same spirit as sanitizeRating/sanitizePrice: keep the name and reason
-// either way (still useful on their own), but the clickable link is always
-// a real search for that alternative's name rather than a URL the model
-// guessed — no store is given per-alternative, so this defaults to Amazon.
+// either way (still useful on their own). The clickable link uses whatever
+// URL the server-side lookup settled on for this alternative — a page
+// cross-checked against Google's own search results when one was found,
+// otherwise a plain liveness-checked version of the model's own link — and
+// only falls back to a guaranteed-real search for that alternative's name
+// when neither of those produced a URL at all.
 function sanitizeAlternatives(alts) {
 if (!Array.isArray(alts)) return [];
-return alts.slice(0, 3).map((alt) => ({
-
-name: alt && alt.name ? String(alt.name) : "",
+return alts.slice(0, 3).map((alt) => {
+const name = alt && alt.name ? String(alt.name) : "";
+const verified = alt && looksLikeRealUrl(alt.url) ? alt.url.trim() : null;
+return {
+name,
 reason: alt && alt.reason ? String(alt.reason) : "",
-url: alt && alt.name ? storeSearchUrl(null, alt.name) : null
-})).filter((alt) => alt.name);
+url: verified || (name ? storeSearchUrl(null, name) : null)
+};
+}).filter((alt) => alt.name);
 }
 
 function fileToBase64(file) {
@@ -872,9 +878,14 @@ const runLookup = async (id, query) => {
 try {
 const info = await callClaude(query);
 const searchQuery = info.name || query;
-const purchaseLink = storeSearchUrl(info.store || info.price_source, searchQuery);
-const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, searchQuery);
-const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, searchQuery);
+// info.listing_url has already been cross-checked server-side against
+// Google's own search results (and, failing that, a plain liveness check)
+// — see netlify/functions/product-lookup.js. Use it directly when present;
+// only fall back to a search link when the server couldn't confirm one.
+const verifiedUrl = looksLikeRealUrl(info.listing_url) ? info.listing_url.trim() : null;
+const purchaseLink = verifiedUrl || storeSearchUrl(info.store || info.price_source, searchQuery);
+const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, searchQuery, verifiedUrl);
+const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, searchQuery, verifiedUrl);
 setItems((prev) => {
 const next = prev.map((it) => {
 
@@ -925,9 +936,10 @@ const runImageLookup = async (id, base64Data, mediaType) => {
 try {
 const info = await callClaudeWithImage(base64Data, mediaType);
 const searchQuery = info.name || "this item";
-const purchaseLink = storeSearchUrl(info.store || info.price_source, searchQuery);
-const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, searchQuery);
-const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, searchQuery);
+const verifiedUrl = looksLikeRealUrl(info.listing_url) ? info.listing_url.trim() : null;
+const purchaseLink = verifiedUrl || storeSearchUrl(info.store || info.price_source, searchQuery);
+const { rating, ratingCount, ratingSource, ratingSourceUrl } = sanitizeRating(info, searchQuery, verifiedUrl);
+const { priceValue, priceSource, priceSourceUrl, priceEstimate } = sanitizePrice(info, searchQuery, verifiedUrl);
 setItems((prev) => {
 const next = prev.map((it) => {
 if (it.id !== id) return it;
